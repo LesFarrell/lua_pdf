@@ -31,6 +31,94 @@ local function read_u16_be(data, pos)
     return a * 256 + b
 end
 
+local function hex_encode(data)
+    return (data:gsub(".", function(byte)
+        return string.format("%02X", string.byte(byte))
+    end))
+end
+
+local function decode_utf8(text)
+    local codepoints = {}
+    local i = 1
+
+    while i <= #text do
+        local b1 = string.byte(text, i)
+        local codepoint
+        local count
+
+        if b1 < 0x80 then
+            codepoint = b1
+            count = 1
+        elseif b1 >= 0xC2 and b1 <= 0xDF then
+            local b2 = string.byte(text, i + 1)
+            if not b2 or b2 < 0x80 or b2 > 0xBF then
+                return nil
+            end
+            codepoint = (b1 - 0xC0) * 0x40 + (b2 - 0x80)
+            count = 2
+        elseif b1 >= 0xE0 and b1 <= 0xEF then
+            local b2 = string.byte(text, i + 1)
+            local b3 = string.byte(text, i + 2)
+            if not b2 or not b3 or b2 < 0x80 or b2 > 0xBF or b3 < 0x80 or b3 > 0xBF then
+                return nil
+            end
+            if (b1 == 0xE0 and b2 < 0xA0) or (b1 == 0xED and b2 > 0x9F) then
+                return nil
+            end
+            codepoint = (b1 - 0xE0) * 0x1000 + (b2 - 0x80) * 0x40 + (b3 - 0x80)
+            count = 3
+        elseif b1 >= 0xF0 and b1 <= 0xF4 then
+            local b2 = string.byte(text, i + 1)
+            local b3 = string.byte(text, i + 2)
+            local b4 = string.byte(text, i + 3)
+            if not b2 or not b3 or not b4 or
+               b2 < 0x80 or b2 > 0xBF or
+               b3 < 0x80 or b3 > 0xBF or
+               b4 < 0x80 or b4 > 0xBF then
+                return nil
+            end
+            if (b1 == 0xF0 and b2 < 0x90) or (b1 == 0xF4 and b2 > 0x8F) then
+                return nil
+            end
+            codepoint = (b1 - 0xF0) * 0x40000 + (b2 - 0x80) * 0x1000 + (b3 - 0x80) * 0x40 + (b4 - 0x80)
+            count = 4
+        else
+            return nil
+        end
+
+        codepoints[#codepoints + 1] = codepoint
+        i = i + count
+    end
+
+    return codepoints
+end
+
+local function encode_utf16be(codepoints)
+    local parts = {string.char(0xFE, 0xFF)}
+
+    for i = 1, #codepoints do
+        local codepoint = codepoints[i]
+        if codepoint <= 0xFFFF then
+            parts[#parts + 1] = string.char(
+                math.floor(codepoint / 256) % 256,
+                codepoint % 256
+            )
+        else
+            codepoint = codepoint - 0x10000
+            local high = 0xD800 + math.floor(codepoint / 0x400)
+            local low = 0xDC00 + (codepoint % 0x400)
+            parts[#parts + 1] = string.char(
+                math.floor(high / 256) % 256,
+                high % 256,
+                math.floor(low / 256) % 256,
+                low % 256
+            )
+        end
+    end
+
+    return table.concat(parts)
+end
+
 local function reverse_bits(value, width)
     local reversed = 0
     for _ = 1, width do
@@ -1025,13 +1113,13 @@ function PDF:_build_info_dictionary()
         local key = entries[i]
         local value = entries[i + 1]
         if value ~= nil and value ~= "" then
-            parts[#parts + 1] = " /" .. key .. " (" .. self:_escape_text(value) .. ")"
+            parts[#parts + 1] = " /" .. self:_pdf_name(key) .. " " .. self:_pdf_text_string(value)
         end
     end
 
     for key, value in pairs(self.metadata) do
         if value ~= nil and value ~= "" then
-            parts[#parts + 1] = " /" .. tostring(key) .. " (" .. self:_escape_text(value) .. ")"
+            parts[#parts + 1] = " /" .. self:_pdf_name(key) .. " " .. self:_pdf_text_string(value)
         end
     end
 
@@ -1076,23 +1164,22 @@ end
 
 -- Translate friendly font arguments into the standard PDF base-font names.
 function PDF:_get_base_font_name(family, style)
-    local fonts = {
-        Helvetica = "Helvetica",
-        Times = "Times-Roman",
-        Courier = "Courier"
+    local font_map = {
+        ["Helvetica-"] = "Helvetica",
+        ["Helvetica-B"] = "Helvetica-Bold",
+        ["Helvetica-I"] = "Helvetica-Oblique",
+        ["Helvetica-BI"] = "Helvetica-BoldOblique",
+        ["Times-"] = "Times-Roman",
+        ["Times-B"] = "Times-Bold",
+        ["Times-I"] = "Times-Italic",
+        ["Times-BI"] = "Times-BoldItalic",
+        ["Courier-"] = "Courier",
+        ["Courier-B"] = "Courier-Bold",
+        ["Courier-I"] = "Courier-Oblique",
+        ["Courier-BI"] = "Courier-BoldOblique",
     }
-    
-    local base = fonts[family] or "Helvetica"
-    
-    if style == "B" then
-        base = base .. "-Bold"
-    elseif style == "I" then
-        base = base .. "-Oblique"
-    elseif style == "BI" then
-        base = base .. "-BoldOblique"
-    end
-    
-    return base
+
+    return font_map[(family or "Helvetica") .. "-" .. (style or "")] or "Helvetica"
 end
 
 -- Draw text at a point or inside a wrapped column and return rendered height.
@@ -1144,7 +1231,7 @@ function PDF:text(x, y, text, width, align)
         end
 
         local y_pt = page_height_pt - mm_to_pt(y) - text_ascent_pt - ((line_index - 1) * line_height_pt)
-        content_lines[#content_lines + 1] = string.format("%.2f %.2f Td", x_pt, y_pt)
+        content_lines[#content_lines + 1] = string.format("1 0 0 1 %.2f %.2f Tm", x_pt, y_pt)
         content_lines[#content_lines + 1] = string.format("(%s) Tj", self:_escape_text(line))
     end
 
@@ -1273,10 +1360,55 @@ end
 
 -- Escape literal-string characters that have special meaning in PDF syntax.
 function PDF:_escape_text(text)
+    text = tostring(text or "")
     text = text:gsub("\\", "\\\\")
     text = text:gsub("%(", "\\(")
     text = text:gsub("%)", "\\)")
     return text
+end
+
+-- Escape a PDF name object, hex-encoding bytes outside the regular-name set.
+function PDF:_pdf_name(name)
+    local text = tostring(name or "")
+    local safe = {}
+
+    for i = 1, #text do
+        local byte = string.byte(text, i)
+        if (byte >= 33 and byte <= 126) and
+           byte ~= 35 and byte ~= 37 and byte ~= 40 and byte ~= 41 and
+           byte ~= 47 and byte ~= 60 and byte ~= 62 and
+           byte ~= 91 and byte ~= 93 and byte ~= 123 and byte ~= 125 then
+            safe[#safe + 1] = string.char(byte)
+        else
+            safe[#safe + 1] = string.format("#%02X", byte)
+        end
+    end
+
+    return table.concat(safe)
+end
+
+-- Encode a text string as either ASCII literal text or UTF-16BE hex, per PDF text-string rules.
+function PDF:_pdf_text_string(value)
+    local text = tostring(value or "")
+    local all_ascii = true
+
+    for i = 1, #text do
+        if string.byte(text, i) > 0x7F then
+            all_ascii = false
+            break
+        end
+    end
+
+    if all_ascii then
+        return "(" .. self:_escape_text(text) .. ")"
+    end
+
+    local codepoints = decode_utf8(text)
+    if codepoints then
+        return "<" .. hex_encode(encode_utf16be(codepoints)) .. ">"
+    end
+
+    return "<" .. hex_encode(text) .. ">"
 end
 
 -- Forms always reference a shared Helvetica resource for widget appearance hints.
@@ -1391,9 +1523,9 @@ function PDF:_build_choice_field_flags(options)
     return flags
 end
 
--- Emit a value as a PDF literal string object.
+-- Emit a value as a PDF text string object.
 function PDF:_pdf_literal(value)
-    return "(" .. self:_escape_text(tostring(value or "")) .. ")"
+    return self:_pdf_text_string(value)
 end
 
 -- Emit an array of values as a PDF string array.
@@ -1464,6 +1596,82 @@ function PDF:_build_radio_appearance(width_pt, height_pt, checked)
     return table.concat(parts, "\n")
 end
 
+local function estimate_helvetica_width_pt(text, font_size)
+    return #tostring(text or "") * font_size * 0.52
+end
+
+-- Build the visible appearance stream for text and choice widgets.
+function PDF:_build_variable_text_appearance(field)
+    local width_pt = field.width_pt
+    local height_pt = field.height_pt
+    local border_width = field.border_width or 1
+    local padding = math.max(border_width + 1.5, 2)
+    local text_left = padding + 1
+    local text_width = math.max(width_pt - (2 * text_left), 0)
+    local line_height = field.font_size * 1.2
+    local baseline_start = height_pt - padding - (field.font_size * 0.8)
+    local lines = {}
+
+    if field.field_type == "text" then
+        if field.multiline then
+            lines = self:_split_text_lines(field.value or "")
+        else
+            lines[1] = self:_split_text_lines(field.value or "")[1] or ""
+        end
+    elseif field.field_type == "choice" then
+        if type(field.value) == "table" then
+            for i = 1, #field.value do
+                lines[i] = tostring(field.value[i] or "")
+            end
+        else
+            lines[1] = tostring(field.value or "")
+        end
+    end
+
+    if #lines == 0 then
+        lines[1] = ""
+    end
+
+    local parts = {
+        "q",
+        string.format("%.3f %.3f %.3f rg", field.background_color[1], field.background_color[2], field.background_color[3]),
+        string.format("%.3f %.3f %.3f RG", field.border_color[1], field.border_color[2], field.border_color[3]),
+        string.format("%.2f w", border_width),
+        string.format("0 0 %.2f %.2f re", width_pt, height_pt),
+        "B",
+    }
+
+    if text_width > 0 and height_pt > (2 * padding) then
+        parts[#parts + 1] = string.format("%.2f %.2f %.2f %.2f re W n", padding, padding, width_pt - (2 * padding), height_pt - (2 * padding))
+    end
+
+    parts[#parts + 1] = "BT"
+    parts[#parts + 1] = string.format("/Helv %d Tf", field.font_size)
+    parts[#parts + 1] = string.format("%.3f %.3f %.3f rg", field.text_color[1], field.text_color[2], field.text_color[3])
+
+    for line_index, line in ipairs(lines) do
+        local y_pt = baseline_start - ((line_index - 1) * line_height)
+        if y_pt < padding then
+            break
+        end
+
+        local x_pt = text_left
+        local text_width_pt = estimate_helvetica_width_pt(line, field.font_size)
+        if field.align == 1 then
+            x_pt = text_left + math.max((text_width - text_width_pt) / 2, 0)
+        elseif field.align == 2 then
+            x_pt = text_left + math.max(text_width - text_width_pt, 0)
+        end
+
+        parts[#parts + 1] = string.format("1 0 0 1 %.2f %.2f Tm", x_pt, y_pt)
+        parts[#parts + 1] = string.format("(%s) Tj", self:_escape_text(line))
+    end
+
+    parts[#parts + 1] = "ET"
+    parts[#parts + 1] = "Q"
+    return table.concat(parts, "\n")
+end
+
 -- Create a text widget and register it with the current AcroForm.
 function PDF:form_text(x, y, width, height, name, options)
     if not self.current_page then
@@ -1499,6 +1707,7 @@ function PDF:form_text(x, y, width, height, name, options)
         height_pt = y2 - y1,
         font_size = font_size,
         align = align,
+        multiline = options.multiline and true or false,
         flags = self:_build_text_field_flags(options),
         border_width = border_width,
         border_color = {br, bg, bb},
@@ -1566,8 +1775,11 @@ function PDF:form_combo(x, y, width, height, name, choices, options)
         value = tostring(value),
         default_value = tostring(options.default_value or value),
         rect = {x1, y1, x2, y2},
+        width_pt = x2 - x1,
+        height_pt = y2 - y1,
         font_size = font_size,
         align = align,
+        combo = true,
         flags = self:_build_choice_field_flags({
             read_only = options.read_only,
             required = options.required,
@@ -1626,8 +1838,12 @@ function PDF:form_list(x, y, width, height, name, choices, options)
         value = value,
         default_value = options.default_value or value,
         rect = {x1, y1, x2, y2},
+        width_pt = x2 - x1,
+        height_pt = y2 - y1,
         font_size = font_size,
         align = align,
+        combo = false,
+        multi_select = options.multi_select and true or false,
         flags = self:_build_choice_field_flags({
             read_only = options.read_only,
             required = options.required,
@@ -2005,6 +2221,7 @@ function PDF:save(filename)
     local acroform_ref
     local field_refs = {}
     local checkbox_appearance_refs = {}
+    local variable_appearance_refs = {}
     local radio_group_refs = {}
     local radio_group_order = {}
     local radio_appearance_refs = {}
@@ -2044,6 +2261,10 @@ function PDF:save(filename)
             else
                 field_refs[field_idx] = obj_num
                 obj_num = obj_num + 1
+                if field.field_type == "text" or field.field_type == "choice" then
+                    variable_appearance_refs[field_idx] = obj_num
+                    obj_num = obj_num + 1
+                end
             end
             if field.field_type == "checkbox" then
                 checkbox_appearance_refs[field_idx] = {
@@ -2144,10 +2365,10 @@ function PDF:save(filename)
             for _, field_idx in ipairs(group.widgets) do
                 kid_refs[#kid_refs + 1] = field_refs[field_idx] .. " 0 R"
             end
-            local value_part = group.selected and (" /V /" .. group.selected) or ""
+            local value_part = group.selected and (" /V /" .. self:_pdf_name(group.selected)) or ""
             objects[group.parent_ref] = string.format(
-                "<</FT /Btn /T (%s) /Ff %d%s /Kids [%s]>>",
-                self:_escape_text(group_name),
+                "<</FT /Btn /T %s /Ff %d%s /Kids [%s]>>",
+                self:_pdf_text_string(group_name),
                 group.flags,
                 value_part,
                 table.concat(kid_refs, " ")
@@ -2164,15 +2385,26 @@ function PDF:save(filename)
                     field.text_color[1],
                     field.text_color[2],
                     field.text_color[3])
+                objects[variable_appearance_refs[field_idx]] = build_stream_object(
+                    string.format(
+                        "/Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <</Font <</Helv %d 0 R>>>>",
+                        field.width_pt,
+                        field.height_pt,
+                        form_font_ref
+                    ),
+                    self:_build_variable_text_appearance(field),
+                    self.compression
+                )
                 objects[field_refs[field_idx]] = string.format(
-                    "<</Type /Annot /Subtype /Widget /FT /Tx /T (%s) /Rect %s /P %d 0 R /F 4 /DA (%s) /Q %d /V (%s) /DV (%s) /MK <</BC [%.3f %.3f %.3f] /BG [%.3f %.3f %.3f]>> /BS <</W %.2f /S /S>> /Ff %d>>",
-                    self:_escape_text(field.name),
+                    "<</Type /Annot /Subtype /Widget /FT /Tx /T %s /Rect %s /P %d 0 R /F 4 /DA (%s) /Q %d /V %s /DV %s /AP <</N %d 0 R>> /MK <</BC [%.3f %.3f %.3f] /BG [%.3f %.3f %.3f]>> /BS <</W %.2f /S /S>> /Ff %d>>",
+                    self:_pdf_text_string(field.name),
                     rect,
                     page_refs[field.page_index],
                     da,
                     field.align,
-                    self:_escape_text(field.value),
-                    self:_escape_text(field.default_value),
+                    self:_pdf_text_string(field.value),
+                    self:_pdf_text_string(field.default_value),
+                    variable_appearance_refs[field_idx],
                     field.border_color[1], field.border_color[2], field.border_color[3],
                     field.background_color[1], field.background_color[2], field.background_color[3],
                     field.border_width,
@@ -2205,8 +2437,8 @@ function PDF:save(filename)
                 )
 
                 objects[field_refs[field_idx]] = string.format(
-                    "<</Type /Annot /Subtype /Widget /FT /Btn /T (%s) /Rect %s /P %d 0 R /F 4 /V %s /AS %s /AP <</N <</Off %d 0 R /Yes %d 0 R>>>> /MK <</BC [0 0 0] /BG [1 1 1] /CA (4)>> /BS <</W 1 /S /S>> /Ff %d>>",
-                    self:_escape_text(field.name),
+                    "<</Type /Annot /Subtype /Widget /FT /Btn /T %s /Rect %s /P %d 0 R /F 4 /V %s /AS %s /AP <</N <</Off %d 0 R /Yes %d 0 R>>>> /MK <</BC [0 0 0] /BG [1 1 1] /CA (4)>> /BS <</W 1 /S /S>> /Ff %d>>",
+                    self:_pdf_text_string(field.name),
                     rect,
                     page_refs[field.page_index],
                     state_name,
@@ -2221,6 +2453,16 @@ function PDF:save(filename)
                     field.text_color[1],
                     field.text_color[2],
                     field.text_color[3])
+                objects[variable_appearance_refs[field_idx]] = build_stream_object(
+                    string.format(
+                        "/Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <</Font <</Helv %d 0 R>>>>",
+                        field.width_pt,
+                        field.height_pt,
+                        form_font_ref
+                    ),
+                    self:_build_variable_text_appearance(field),
+                    self.compression
+                )
                 local choice_opts = self:_pdf_string_array(field.choices)
                 local value_literal
                 local default_literal
@@ -2235,8 +2477,8 @@ function PDF:save(filename)
                     default_literal = self:_pdf_literal(field.default_value)
                 end
                 objects[field_refs[field_idx]] = string.format(
-                    "<</Type /Annot /Subtype /Widget /FT /Ch /T (%s) /Rect %s /P %d 0 R /F 4 /DA (%s) /Q %d /Opt %s /V %s /DV %s /MK <</BC [%.3f %.3f %.3f] /BG [%.3f %.3f %.3f]>> /BS <</W %.2f /S /S>> /TI %d /Ff %d>>",
-                    self:_escape_text(field.name),
+                    "<</Type /Annot /Subtype /Widget /FT /Ch /T %s /Rect %s /P %d 0 R /F 4 /DA (%s) /Q %d /Opt %s /V %s /DV %s /AP <</N %d 0 R>> /MK <</BC [%.3f %.3f %.3f] /BG [%.3f %.3f %.3f]>> /BS <</W %.2f /S /S>> /TI %d /Ff %d>>",
+                    self:_pdf_text_string(field.name),
                     rect,
                     page_refs[field.page_index],
                     da,
@@ -2244,6 +2486,7 @@ function PDF:save(filename)
                     choice_opts,
                     value_literal,
                     default_literal,
+                    variable_appearance_refs[field_idx],
                     field.border_color[1], field.border_color[2], field.border_color[3],
                     field.background_color[1], field.background_color[2], field.background_color[3],
                     field.border_width,
@@ -2252,8 +2495,8 @@ function PDF:save(filename)
                 )
             elseif field.field_type == "signature" then
                 objects[field_refs[field_idx]] = string.format(
-                    "<</Type /Annot /Subtype /Widget /FT /Sig /T (%s) /Rect %s /P %d 0 R /F 4 /MK <</BC [%.3f %.3f %.3f] /BG [%.3f %.3f %.3f]>> /BS <</W %.2f /S /S>> /Ff %d>>",
-                    self:_escape_text(field.name),
+                    "<</Type /Annot /Subtype /Widget /FT /Sig /T %s /Rect %s /P %d 0 R /F 4 /MK <</BC [%.3f %.3f %.3f] /BG [%.3f %.3f %.3f]>> /BS <</W %.2f /S /S>> /Ff %d>>",
+                    self:_pdf_text_string(field.name),
                     rect,
                     page_refs[field.page_index],
                     field.border_color[1], field.border_color[2], field.border_color[3],
@@ -2264,7 +2507,7 @@ function PDF:save(filename)
             elseif field.field_type == "radio" then
                 local appearance_refs = radio_appearance_refs[field_idx]
                 local group = radio_group_refs[field.name]
-                local on_state = "/" .. field.option_name
+                local on_state = "/" .. self:_pdf_name(field.option_name)
                 local state_name = field.checked and on_state or "/Off"
                 local off_stream = self:_build_radio_appearance(field.width_pt, field.height_pt, false)
                 local on_stream = self:_build_radio_appearance(field.width_pt, field.height_pt, true)
@@ -2317,14 +2560,14 @@ function PDF:save(filename)
             local color = annotation.color or {1, 1, 0}
             local r, g, b = normalize_rgb(color[1] or 1, color[2] or 1, color[3] or 0)
             local open_part = annotation.open and "true" or "false"
-            local title_part = annotation.title ~= "" and (" /T (" .. self:_escape_text(annotation.title) .. ")") or ""
+            local title_part = annotation.title ~= "" and (" /T " .. self:_pdf_text_string(annotation.title)) or ""
             objects[annotation_refs[annotation_idx]] = string.format(
-                "<</Type /Annot /Subtype /Text /Rect %s /Contents (%s)%s /Open %s /Name /%s /C [%.3f %.3f %.3f]>>",
+                "<</Type /Annot /Subtype /Text /Rect %s /Contents %s%s /Open %s /Name /%s /C [%.3f %.3f %.3f]>>",
                 rect,
-                self:_escape_text(annotation.contents),
+                self:_pdf_text_string(annotation.contents),
                 title_part,
                 open_part,
-                self:_escape_text(annotation.icon),
+                self:_pdf_name(annotation.icon),
                 r, g, b
             )
         end
@@ -2335,9 +2578,10 @@ function PDF:save(filename)
     local info_obj = obj_num
     
     -- Write PDF
-    file:write("%PDF-1.4\n")
+    local header = "%PDF-1.4\n%\128\129\130\131\n"
+    file:write(header)
     
-    local offset = #"%PDF-1.4\n"
+    local offset = #header
     
     -- Write objects
     for i = 1, info_obj do

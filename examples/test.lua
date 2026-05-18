@@ -195,13 +195,13 @@ doc:form_list(10, 120, 90, 22, "test_tags", {
 })
 doc:text(10, 152, "Signature")
 doc:form_signature(10, 156, 70, 16, "test_signature")
-doc:text(110, 22, "Priority")
-doc:form_radio(110, 26, 6, "test_priority", "Low", false)
-doc:text(118, 28, "Low")
-doc:form_radio(110, 36, 6, "test_priority", "Medium", true)
-doc:text(118, 38, "Medium")
-doc:form_radio(110, 46, 6, "test_priority", "High", false)
-doc:text(118, 48, "High")
+doc:text(110, 94, "Priority")
+doc:form_radio(110, 98, 6, "test_priority", "Low", false)
+doc:text(118, 100, "Low")
+doc:form_radio(110, 108, 6, "test_priority", "Medium", true)
+doc:text(118, 110, "Medium")
+doc:form_radio(110, 118, 6, "test_priority", "High", false)
+doc:text(118, 120, "High")
 assert(#doc.forms == 9, "Should have 9 form fields")
 print("✓ Form field definitions recorded")
 
@@ -233,6 +233,7 @@ doc:set_metadata({
     creator = "examples/test.lua",
     producer = "Lua PDF Test Suite",
     Department = "QA",
+    Reviewer = "Cafe" .. string.char(0xC3, 0xA9),
 })
 assert(doc.creator == "examples/test.lua", "Metadata creator should be updated")
 assert(doc.metadata.Department == "QA", "Custom metadata should be stored")
@@ -273,6 +274,37 @@ if success then
 else
     print("✗ Error generating PDF: " .. error_msg)
 end
+
+print("\nTest 15: Checking spec-oriented serialization details...")
+local spec_doc = PDF.new()
+spec_doc.compression = false
+spec_doc.title = "Cafe" .. string.char(0xC3, 0xA9)
+spec_doc:set_metadata({
+    Department = "R" .. string.char(0xC3, 0xA9) .. "sum" .. string.char(0xC3, 0xA9),
+})
+spec_doc:add_page(210, 297)
+spec_doc:set_font("Times", "I", 12)
+spec_doc:text(10, 10, "First line\nSecond line")
+spec_doc:form_text(10, 20, 60, 10, "spec_field", {
+    value = "Value",
+})
+spec_doc:save("spec_output.pdf")
+
+local spec_file = assert(io.open("spec_output.pdf", "rb"))
+local spec_contents = spec_file:read("*all")
+spec_file:close()
+
+assert(spec_contents:sub(1, 9) == "%PDF-1.4\n", "PDF header should begin with %PDF-1.4")
+local b1, b2, b3, b4 = string.byte(spec_contents, 11, 14)
+assert(b1 and b1 >= 128 and b2 and b2 >= 128 and b3 and b3 >= 128 and b4 and b4 >= 128,
+    "Binary PDF header marker should include at least four bytes above 127")
+assert(spec_contents:find("/BaseFont /Times-Italic", 1, true), "Times italic should use the standard base-14 font name")
+assert(spec_contents:find("/NeedAppearances false", 1, true), "Widgets with explicit appearances should not require viewer-generated appearances")
+assert(spec_contents:find("/FT /Tx", 1, true) and spec_contents:find("/AP <</N ", 1, true), "Variable text widgets should include explicit appearance streams")
+assert(spec_contents:find("<FEFF", 1, true), "Non-ASCII text strings should be serialized as UTF-16BE hex strings")
+assert(spec_contents:find(" Tm\n%(First line%) Tj\n1 0 0 1 ", 1), "Text positioning should use absolute text matrices per line")
+os.remove("spec_output.pdf")
+print("✓ Spec-oriented serialization checks passed")
 
 -- Summary
 print("\n" .. string.rep("=", 50))
