@@ -2135,7 +2135,7 @@ function PDF:save(filename)
         end
         local form_font_ref = font_refs[self:_ensure_form_font()]
         objects[acroform_ref] = "<</Fields [" .. table.concat(field_list, " ") ..
-            "] /NeedAppearances true /DR <</Font <</Helv " .. form_font_ref ..
+            "] /NeedAppearances false /DR <</Font <</Helv " .. form_font_ref ..
             " 0 R>>>> /DA (/Helv 12 Tf 0 g)>>"
 
         for _, group_name in ipairs(radio_group_order) do
@@ -2289,7 +2289,7 @@ function PDF:save(filename)
                 )
 
                 objects[field_refs[field_idx]] = string.format(
-                    "<</Type /Annot /Subtype /Widget /Parent %d 0 R /Rect %s /P %d 0 R /F 4 /AS %s /AP <</N <</Off %d 0 R %s %d 0 R>>>> /MK <</BC [0 0 0] /BG [1 1 1]>> /BS <</W 1 /S /S>>>>",
+                    "<</Type /Annot /Subtype /Widget /Parent %d 0 R /Rect %s /P %d 0 R /F 4 /AS %s /AP <</N <</Off %d 0 R %s %d 0 R>>>> /Border [0 0 0]>>",
                     group.parent_ref,
                     rect,
                     page_refs[field.page_index],
