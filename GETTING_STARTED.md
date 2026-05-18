@@ -1,289 +1,244 @@
 # Getting Started with Lua PDF Library
 
+`pdf.lua` is a single-file, pure Lua PDF generator. It can create multi-page PDFs with text, shapes, PNG images, annotations, helper-driven layouts, and basic AcroForm widgets.
+
 ## Installation
 
-1. Download `pdf.lua` to your project directory
-2. Ensure you have Lua 5.1 or later installed
+1. Copy `pdf.lua` into your project or Lua package path.
+2. Use Lua 5.1 or later.
+3. Require the module:
 
-## Basic Usage
+```lua
+local PDF = require("pdf")
+```
 
-### Creating Your First PDF
+## First PDF
 
 ```lua
 local PDF = require("pdf")
 
--- Create a new document
 local doc = PDF.new()
+doc.title = "Hello"
+doc.author = "Lua PDF Library"
 
--- Add a page (width and height in millimeters)
-doc:add_page(210, 297)  -- A4 size
-
--- Set font and add text
+doc:add_page(PDF.PaperSizes.A4.width, PDF.PaperSizes.A4.height)
 doc:set_font("Helvetica", "B", 16)
-doc:text(10, 10, "Hello, World!")
+doc:text(10, 12, "Hello, World!")
 
--- Save the PDF
+doc:set_color_fill(52, 152, 219)
+doc:rect(10, 22, 60, 18, "F")
+
+doc:set_font("Helvetica", "", 10)
+doc:set_color_fill(255, 255, 255)
+doc:text(40, 33, "Generated in pure Lua", nil, "C")
+
 doc:save("hello.pdf")
 ```
 
-### Running the Examples
+Notes:
+- Coordinates are in millimeters.
+- The origin is the top-left corner.
+- Stream compression is enabled by default. Set `doc.compression = false` before `save()` if you want raw streams.
+
+## Run the Examples
+
+From the repository root:
 
 ```bash
 lua examples/basic_text_shapes.lua
 lua examples/multipage_document.lua
 lua examples/report_layout.lua
+lua examples/advanced_features.lua
+lua examples/forms.lua
+lua examples/png_embedding.lua
+lua examples/test.lua
 ```
+
+What each example covers:
+- `basic_text_shapes.lua`: text, wrapping, shapes, links, note annotations
+- `multipage_document.lua`: multi-page layout and styling
+- `report_layout.lua`: report-style composition and a local table helper
+- `advanced_features.lua`: helper methods such as title pages, progress bars, and checklists
+- `forms.lua`: AcroForm text, checkbox, combo, list, radio, and signature widgets
+- `png_embedding.lua`: PNG embedding with transparency
+- `test.lua`: bundled smoke/integration test
 
 ## Common Tasks
 
-### Adding Multiple Pages
+### Add pages
 
 ```lua
 local doc = PDF.new()
 
--- Page 1
 doc:add_page(210, 297)
 doc:set_font("Helvetica", "", 12)
 doc:text(10, 10, "This is page 1")
 
--- Page 2
 doc:add_page(210, 297)
 doc:text(10, 10, "This is page 2")
 
 doc:save("multipage.pdf")
 ```
 
-### Working with Colors
+### Add wrapped text
 
 ```lua
-local doc = PDF.new()
-doc:add_page(210, 297)
-
--- Using 0-255 RGB values
-doc:set_color_fill(255, 0, 0)  -- Red
-doc:rect(10, 10, 50, 30, "F")  -- Fill red rectangle
-
--- Using 0-1 RGB values
-doc:set_color_fill(0, 1, 0)    -- Green
-doc:circle(100, 30, 15, "F")
-
--- Using predefined colors from PDF.Utils
-doc:set_color_fill(PDF.Utils.Colors.blue[1], PDF.Utils.Colors.blue[2], PDF.Utils.Colors.blue[3])
+doc:set_font("Helvetica", "", 11)
+local height = doc:text(
+    10,
+    20,
+    "This paragraph wraps automatically when a width is supplied.",
+    60,
+    "L"
+)
 ```
 
-### Text Formatting
+`height` is the rendered height in millimeters.
+
+### Draw shapes
 
 ```lua
-local doc = PDF.new()
-doc:add_page(210, 297)
-
--- Regular text
-doc:set_font("Helvetica", "", 12)
-doc:text(10, 10, "Regular text")
-
--- Bold text
-doc:set_font("Helvetica", "B", 12)
-doc:text(10, 25, "Bold text")
-
--- Italic text
-doc:set_font("Helvetica", "I", 12)
-doc:text(10, 40, "Italic text")
-
--- Bold Italic
-doc:set_font("Helvetica", "BI", 12)
-doc:text(10, 55, "Bold Italic text")
-
--- Different font families
-doc:set_font("Times", "", 12)
-doc:text(10, 70, "Times-Roman font")
-
-doc:set_font("Courier", "", 12)
-doc:text(10, 85, "Courier (monospace) font")
-```
-
-### Drawing Shapes
-
-```lua
-local doc = PDF.new()
-doc:add_page(210, 297)
-
--- Rectangle (filled)
 doc:set_color_fill(100, 150, 200)
 doc:rect(10, 10, 50, 30, "F")
 
--- Rectangle (outline only)
 doc:set_color_stroke(0, 0, 0)
 doc:set_line_width(0.5)
 doc:rect(70, 10, 50, 30, "S")
-
--- Rectangle (filled and outlined)
-doc:rect(130, 10, 50, 30, "DF")
-
--- Circle (filled)
-doc:set_color_fill(255, 0, 0)
 doc:circle(35, 70, 10, "F")
-
--- Circle (outline)
-doc:circle(100, 70, 10, "S")
-
--- Line
-doc:set_color_stroke(0, 0, 0)
 doc:line(10, 100, 100, 100)
-
--- Thick line
-doc:set_line_width(2)
-doc:line(10, 110, 100, 110)
 ```
 
-### Using Built-In Helpers
+### Work with PNGs
 
 ```lua
-local PDF = require("pdf")
-
-local doc = PDF.new()
-doc:add_page(210, 297)
-
--- Add header
-local y = doc:add_header("My Report", "Monthly Summary")
-
--- Add section header
-y = doc:section_header("Results", y)
-
--- Add content boxes
-doc:highlight_box(10, y, 50, 20, "Performance: 95%", {52, 152, 219}, {255, 255, 255})
-
--- Add footer
-doc:add_footer(true)  -- true = show date
-
-doc:save("report.pdf")
+doc:image_png("examples/blh_cat_transparent.png", 20, 40, 80, 80)
 ```
 
-### Working with Coordinates
-
-The library uses millimeters (mm) as the default unit:
-- Origin (0, 0) is at the top-left corner
-- X increases to the right
-- Y increases downward
-- Standard A4: 210mm × 297mm
-
 ```lua
-local doc = PDF.new()
-doc:add_page(210, 297)
-
--- Top-left corner
-doc:text(0, 0, "Top-left")
-
--- Center
-doc:text(105, 148, "Center", nil, "C")
-
--- Bottom-right
-doc:text(200, 290, "Bottom-right", nil, "R")
+local raw_png = assert(io.open("icon.png", "rb")):read("*all")
+doc:image_png_data(raw_png, 20, 130, 25, 25, "icon-cache-key")
 ```
 
-### Utilities Reference
+### Add annotations
 
 ```lua
--- Unit conversions
-local points = PDF.Utils.mm_to_pt(10)           -- mm to points
-local mm = PDF.Utils.pt_to_mm(28.35)            -- points to mm
-local mm2 = PDF.Utils.in_to_mm(1)               -- inches to mm
-local inches = PDF.Utils.mm_to_in(25.4)         -- mm to inches
+doc:text(10, 20, "Project website")
+doc:link(10, 20, 35, 6, "https://example.com")
 
--- Get paper size
-local a4_width = PDF.Utils.PaperSizes.A4.width
-local letter_height = PDF.Utils.PaperSizes.Letter.height
+doc:note(50, 20, 8, 8, "Follow up on this section", {
+    title = "Reviewer",
+    icon = "Comment",
+})
+```
 
--- Work with colors
-local color_name = PDF.Utils.Colors.red
+### Use layout helpers
+
+```lua
+local y = doc:add_header("Monthly Report", "April 2026")
+y = doc:section_header("Summary", y + 10)
+doc:highlight_box(10, y, 60, 18, "Healthy", {46, 204, 113}, {255, 255, 255})
+doc:add_footer(true)
+```
+
+Available helper-backed methods:
+- `add_header`
+- `add_footer`
+- `section_header`
+- `highlight_box`
+- `box`
+- `title_page`
+- `page_break`
+- `two_column_layout`
+- `watermark`
+- `checklist_item`
+- `progress_bar`
+
+### Add form fields
+
+```lua
+doc:text(10, 20, "Name")
+doc:form_text(10, 24, 90, 10, "customer_name", {
+    value = "Ada Lovelace",
+})
+
+doc:text(10, 42, "Subscribe")
+doc:form_checkbox(10, 46, 6, "newsletter_opt_in", true)
+
+doc:text(10, 60, "Department")
+doc:form_combo(10, 64, 80, 10, "department", {
+    "Research",
+    "Engineering",
+    "Operations",
+}, {
+    value = "Engineering",
+})
+```
+
+The library supports:
+- text fields
+- checkboxes
+- radio groups
+- combo boxes
+- list boxes
+- empty signature widgets
+
+## Handy Utilities
+
+```lua
+local a4 = PDF.PaperSizes.A4
+local blue = PDF.Colors.blue
+
+local pt = PDF.Utils.mm_to_pt(10)
+local mm = PDF.Utils.pt_to_mm(28.35)
 local hex = PDF.Utils.rgb_to_hex(255, 0, 0)
 local r, g, b = PDF.Utils.hex_to_rgb("#FF0000")
-
--- Color gradients
-local gradient = PDF.Utils.color_gradient(
-    PDF.Utils.Colors.red, 
-    PDF.Utils.Colors.blue, 
-    10  -- steps
-)
-
--- Angle conversions
-local radians = PDF.Utils.degrees_to_radians(90)
-local degrees = PDF.Utils.radians_to_degrees(math.pi)
-
--- Get current timestamp
-local timestamp = PDF.Utils.get_pdf_timestamp()
 ```
 
-## API Quick Reference
-
-### Document Methods
-
-| Method | Parameters | Description |
-|--------|-----------|-------------|
-| `PDF.new()` | - | Create new PDF |
-| `doc:add_page(w, h, [orient])` | width, height, orientation | Add page |
-| `doc:set_font(family, [style], [size])` | family, style, size | Set font |
-| `doc:text(x, y, text, [w], [align])` | x, y, text, width, align | Add text |
-| `doc:rect(x, y, w, h, [style])` | x, y, width, height, style | Draw rectangle |
-| `doc:circle(x, y, r, [style])` | x, y, radius, style | Draw circle |
-| `doc:line(x1, y1, x2, y2)` | x1, y1, x2, y2 | Draw line |
-| `doc:set_color_fill(r, g, b, [a])` | r, g, b, alpha | Set fill color |
-| `doc:set_color_stroke(r, g, b, [a])` | r, g, b, alpha | Set stroke color |
-| `doc:set_line_width(w)` | width | Set line width |
-| `doc:save(filename)` | filename | Save to file |
-
-### Style Parameters
-
-**Font Styles:**
-- `""` - Regular
-- `"B"` - Bold
-- `"I"` - Italic
-- `"BI"` - Bold Italic
-
-**Shape Styles:**
-- `"S"` - Stroke (outline)
-- `"F"` - Fill
-- `"DF"` - Fill and stroke
-
-**Text Alignment:**
-- `"L"` - Left
-- `"C"` - Center
-- `"R"` - Right
+Useful exported groups:
+- `PDF.PaperSizes`
+- `PDF.Colors`
+- `PDF.Utils`
+- `PDF.Helper`
+- `PDF.QuickRef`
 
 ## Troubleshooting
 
-### PDF not being created
-- Ensure you called `doc:save()` at the end
-- Check that the file path is writable
-- Verify no other file has the same name
+### PDF is not created
 
-### Text not appearing
-- Confirm you added a page with `doc:add_page()`
-- Make sure the text position is within the page bounds
-- Check that font is set with `doc:set_font()`
+- Confirm `doc:save("file.pdf")` is being called.
+- Make sure the output path is writable.
+- Check for runtime errors printed by Lua.
 
-### Shapes not visible
-- Verify fill or stroke color is set
-- Ensure shape dimensions are positive
-- Check that coordinates are within page bounds
+### Text is missing
 
-## Performance Tips
+- Call `doc:add_page()` before drawing.
+- Call `doc:set_font()` before `doc:text()`.
+- Make sure coordinates are inside the page bounds.
 
-1. Reuse fonts - set a font once and reuse it for multiple texts
-2. Group similar operations - set colors before drawing multiple shapes
-3. For large documents, generate pages dynamically instead of loading all in memory
+### PNG loading fails
 
-## Limitations
+- Confirm the file is a PNG.
+- Use a readable path from the current working directory.
+- Note that PNG is the only supported image format today.
 
-- Limited to standard PDF fonts (no custom fonts)
-- No image support yet
-- No form fields or annotations
-- No table support (but you can draw them manually)
-- No text wrapping (but you can split text manually)
+### Form field creation fails
 
-## Next Steps
+- Make sure a page exists before creating fields.
+- Supply non-empty field names.
+- For radio buttons, use a shared `group_name` and unique `option_name` values.
 
-- Check out the [examples/](examples/) directory for more complex usage patterns
-- Read [README.md](README.md) for API documentation
-- Explore the [test.lua](test.lua) file for validation
+## Current Limitations
 
-Happy PDF creating! 📄✨
+- Built-in fonts only; no custom font embedding yet
+- General drawing transparency is not emitted as PDF transparency
+- PNG is the only supported image format
+- Forms are limited to basic AcroForm widgets
+- Signature fields are unsigned containers only
+- Non-form annotations are limited to external links and text notes
+- Metadata is written to the PDF Info dictionary only; XMP is not emitted
+
+## Where to Look Next
+
+- [README.md](README.md): full API reference
+- [INDEX.md](INDEX.md): project map and example guide
+- [examples](examples): runnable sample scripts

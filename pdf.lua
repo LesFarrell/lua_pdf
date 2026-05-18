@@ -9,7 +9,7 @@ local Helper = {}
 local QuickRef = {}
 local unpack_values = table.unpack or unpack
 
--- Utility functions
+-- Basic scalar and byte helpers used throughout layout, parsing, and serialization.
 local function mm_to_pt(mm)
     return mm * 2.83464567  -- 1 mm = 2.83464567 points
 end
@@ -40,6 +40,7 @@ local function reverse_bits(value, width)
     return reversed
 end
 
+-- Canonical Huffman decode-table builder used by the PNG inflate implementation.
 local function build_huffman(lengths)
     local max_len = 0
     for i = 1, #lengths do
@@ -84,6 +85,329 @@ local function build_huffman(lengths)
     }
 end
 
+-- Canonical Huffman code builder used by the built-in fixed-Huffman deflate encoder.
+local function build_huffman_codes(lengths)
+    local max_len = 0
+    for i = 1, #lengths do
+        if lengths[i] > max_len then
+            max_len = lengths[i]
+        end
+    end
+
+    local counts = {}
+    for len = 0, max_len do
+        counts[len] = 0
+    end
+    for i = 1, #lengths do
+        counts[lengths[i]] = counts[lengths[i]] + 1
+    end
+
+    local next_code = {}
+    local code = 0
+    counts[0] = counts[0] or 0
+    for bits = 1, max_len do
+        code = (code + (counts[bits - 1] or 0)) * 2
+        next_code[bits] = code
+    end
+
+    local codes = {}
+    for symbol = 0, #lengths - 1 do
+        local len = lengths[symbol + 1]
+        if len > 0 then
+            local assigned = next_code[len]
+            next_code[len] = assigned + 1
+            codes[symbol] = {
+                code = reverse_bits(assigned, len),
+                bit_length = len,
+            }
+        end
+    end
+
+    return codes
+end
+
+local FIXED_LITERAL_LENGTHS = {}
+for i = 0, 287 do
+    if i <= 143 then
+        FIXED_LITERAL_LENGTHS[i + 1] = 8
+    elseif i <= 255 then
+        FIXED_LITERAL_LENGTHS[i + 1] = 9
+    elseif i <= 279 then
+        FIXED_LITERAL_LENGTHS[i + 1] = 7
+    else
+        FIXED_LITERAL_LENGTHS[i + 1] = 8
+    end
+end
+
+local FIXED_DISTANCE_LENGTHS = {}
+for i = 0, 31 do
+    FIXED_DISTANCE_LENGTHS[i + 1] = 5
+end
+
+local FIXED_LITERAL_CODES = build_huffman_codes(FIXED_LITERAL_LENGTHS)
+local FIXED_DISTANCE_CODES = build_huffman_codes(FIXED_DISTANCE_LENGTHS)
+
+local LENGTH_BASES = {3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258}
+local LENGTH_EXTRAS = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
+local DISTANCE_BASES = {1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577}
+local DISTANCE_EXTRAS = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13}
+local DEFLATE_WINDOW_SIZE = 32768
+local DEFLATE_MIN_MATCH = 3
+local DEFLATE_MAX_MATCH = 258
+local DEFLATE_MAX_CHAIN = 10
+local DEFLATE_HASH_SIZE = 16384
+
+-- Adler-32 checksum for the zlib wrapper around compressed PDF streams.
+local function adler32(data)
+    local s1 = 1
+    local s2 = 0
+
+    for i = 1, #data do
+        s1 = s1 + string.byte(data, i)
+        if s1 >= 65521 then
+            s1 = s1 - 65521
+        end
+
+        s2 = s2 + s1
+        if s2 >= 65521 then
+            s2 = s2 % 65521
+        end
+    end
+
+    return s2 * 65536 + s1
+end
+
+-- Pack a 32-bit integer as big-endian binary.
+local function pack_u32_be(value)
+    local b1 = math.floor(value / 16777216) % 256
+    local b2 = math.floor(value / 65536) % 256
+    local b3 = math.floor(value / 256) % 256
+    local b4 = value % 256
+    return string.char(b1, b2, b3, b4)
+end
+
+-- Lightweight bit writer for LSB-first deflate payload emission.
+local function make_bit_writer()
+    return {
+        chunks = {},
+        bytes = {},
+        byte_count = 0,
+        bit_buffer = 0,
+        bit_count = 0,
+    }
+end
+
+local function writer_append_byte(writer, byte)
+    writer.byte_count = writer.byte_count + 1
+    writer.bytes[writer.byte_count] = string.char(byte)
+    if writer.byte_count >= 4096 then
+        writer.chunks[#writer.chunks + 1] = table.concat(writer.bytes)
+        writer.bytes = {}
+        writer.byte_count = 0
+    end
+end
+
+-- Append a variable-width value to the bit stream one bit at a time.
+local function writer_write_bits(writer, value, bit_length)
+    local bit_buffer = writer.bit_buffer
+    local bit_count = writer.bit_count
+
+    for _ = 1, bit_length do
+        if value % 2 == 1 then
+            bit_buffer = bit_buffer + (2 ^ bit_count)
+        end
+        value = math.floor(value / 2)
+        bit_count = bit_count + 1
+
+        if bit_count == 8 then
+            writer_append_byte(writer, bit_buffer)
+            bit_buffer = 0
+            bit_count = 0
+        end
+    end
+
+    writer.bit_buffer = bit_buffer
+    writer.bit_count = bit_count
+end
+
+-- Flush any pending bits and concatenate buffered byte chunks.
+local function finish_bit_writer(writer)
+    if writer.bit_count > 0 then
+        writer_append_byte(writer, writer.bit_buffer)
+    end
+    if writer.byte_count > 0 then
+        writer.chunks[#writer.chunks + 1] = table.concat(writer.bytes)
+    end
+    return table.concat(writer.chunks)
+end
+
+-- Map a match length to the corresponding deflate symbol and extra bits.
+local function get_length_code(length)
+    for i = 1, #LENGTH_BASES do
+        local base = LENGTH_BASES[i]
+        local extra_bits = LENGTH_EXTRAS[i]
+        local max_length = base + ((2 ^ extra_bits) - 1)
+        if length <= max_length then
+            return 256 + i, extra_bits, length - base
+        end
+    end
+    return 285, 0, 0
+end
+
+-- Map a back-reference distance to the corresponding deflate symbol and extra bits.
+local function get_distance_code(distance)
+    for i = 1, #DISTANCE_BASES do
+        local base = DISTANCE_BASES[i]
+        local extra_bits = DISTANCE_EXTRAS[i]
+        local max_distance = base + ((2 ^ extra_bits) - 1)
+        if distance <= max_distance then
+            return i - 1, extra_bits, distance - base
+        end
+    end
+    return 29, 13, distance - DISTANCE_BASES[30]
+end
+
+-- Hash a 3-byte sliding window so repeated substrings can be located cheaply.
+local function deflate_hash(data, pos)
+    local b1, b2, b3 = string.byte(data, pos, pos + 2)
+    return (((b1 or 0) * 251 + (b2 or 0)) * 251 + (b3 or 0)) % DEFLATE_HASH_SIZE + 1
+end
+
+-- Remember recent positions for later match searches within the deflate window.
+local function deflate_store_position(hash_table, data, pos, data_len)
+    if pos > data_len - 2 then
+        return
+    end
+
+    local hash = deflate_hash(data, pos)
+    local bucket = hash_table[hash]
+    if not bucket then
+        hash_table[hash] = {pos}
+        return
+    end
+
+    while #bucket > 0 and pos - bucket[1] > DEFLATE_WINDOW_SIZE do
+        table.remove(bucket, 1)
+    end
+    if #bucket >= DEFLATE_MAX_CHAIN then
+        table.remove(bucket, 1)
+    end
+    bucket[#bucket + 1] = pos
+end
+
+-- Search recent history for the best match at the current position.
+local function deflate_find_match(hash_table, data, pos, data_len)
+    if pos > data_len - 2 then
+        return 0, 0
+    end
+
+    local bucket = hash_table[deflate_hash(data, pos)]
+    if not bucket then
+        return 0, 0
+    end
+
+    local best_length = 0
+    local best_distance = 0
+    local max_length = math.min(DEFLATE_MAX_MATCH, data_len - pos + 1)
+
+    for i = #bucket, 1, -1 do
+        local candidate = bucket[i]
+        local distance = pos - candidate
+
+        if distance > 0 and distance <= DEFLATE_WINDOW_SIZE then
+            local length = 0
+            while length < max_length and
+                  string.byte(data, candidate + length) == string.byte(data, pos + length) do
+                length = length + 1
+            end
+
+            if length >= DEFLATE_MIN_MATCH and length > best_length then
+                best_length = length
+                best_distance = distance
+                if length == DEFLATE_MAX_MATCH then
+                    break
+                end
+            end
+        end
+    end
+
+    return best_length, best_distance
+end
+
+-- Compress stream payloads with a compact fixed-Huffman deflate implementation.
+local function compress_flate(data)
+    if data == "" then
+        return string.char(0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01)
+    end
+
+    local writer = make_bit_writer()
+    local hash_table = {}
+    local data_len = #data
+    local pos = 1
+
+    -- Single final block using fixed Huffman codes.
+    writer_write_bits(writer, 1, 1)
+    writer_write_bits(writer, 1, 2)
+
+    while pos <= data_len do
+        local match_length, match_distance = deflate_find_match(hash_table, data, pos, data_len)
+
+        if match_length >= DEFLATE_MIN_MATCH then
+            local length_symbol, length_extra_bits, length_extra = get_length_code(match_length)
+            local distance_symbol, distance_extra_bits, distance_extra = get_distance_code(match_distance)
+            local literal_code = FIXED_LITERAL_CODES[length_symbol]
+            local distance_code = FIXED_DISTANCE_CODES[distance_symbol]
+
+            writer_write_bits(writer, literal_code.code, literal_code.bit_length)
+            if length_extra_bits > 0 then
+                writer_write_bits(writer, length_extra, length_extra_bits)
+            end
+
+            writer_write_bits(writer, distance_code.code, distance_code.bit_length)
+            if distance_extra_bits > 0 then
+                writer_write_bits(writer, distance_extra, distance_extra_bits)
+            end
+
+            for offset = 0, match_length - 1 do
+                deflate_store_position(hash_table, data, pos + offset, data_len)
+            end
+            pos = pos + match_length
+        else
+            local literal = string.byte(data, pos)
+            local literal_code = FIXED_LITERAL_CODES[literal]
+            writer_write_bits(writer, literal_code.code, literal_code.bit_length)
+            deflate_store_position(hash_table, data, pos, data_len)
+            pos = pos + 1
+        end
+    end
+
+    local end_code = FIXED_LITERAL_CODES[256]
+    writer_write_bits(writer, end_code.code, end_code.bit_length)
+
+    return string.char(0x78, 0x01) .. finish_bit_writer(writer) .. pack_u32_be(adler32(data))
+end
+
+-- Build a PDF stream object and only enable FlateDecode when it saves space.
+local function build_stream_object(dictionary_entries, stream_data, enable_compression)
+    local dict = dictionary_entries or ""
+    if dict ~= "" and not dict:match("%s$") then
+        dict = dict .. " "
+    end
+
+    local payload = stream_data
+    local filter_part = ""
+    if enable_compression and #stream_data > 32 then
+        local compressed = compress_flate(stream_data)
+        if #compressed < #stream_data then
+            payload = compressed
+            filter_part = "/Filter /FlateDecode "
+        end
+    end
+
+    return string.format("<<%s%s/Length %d>>\nstream\n%s\nendstream", dict, filter_part, #payload, payload)
+end
+
+-- Inflate zlib-compressed PNG payloads without any external dependency.
 local function inflate_zlib(data)
     if #data < 2 then
         error("Invalid zlib stream")
@@ -298,6 +622,7 @@ local function inflate_zlib(data)
     return table.concat(chunks)
 end
 
+-- Normalize PNG samples of varying bit depths into 8-bit channel values.
 local function scale_sample(sample, bit_depth)
     if bit_depth == 8 then
         return sample
@@ -311,6 +636,7 @@ local function scale_sample(sample, bit_depth)
     return math.floor((sample * 255) / max + 0.5)
 end
 
+-- Expand packed PNG samples into a flat sample array for one decoded row.
 local function unpack_samples(row, width, samples_per_pixel, bit_depth)
     local samples = {}
     local index = 1
@@ -342,6 +668,7 @@ local function unpack_samples(row, width, samples_per_pixel, bit_depth)
     return samples
 end
 
+-- Reverse PNG row filters so raw pixel samples can be read pass by pass.
 local function unfilter_scanlines(data, width, height, bits_per_pixel)
     local bpp = math.max(1, math.ceil(bits_per_pixel / 8))
     local row_bytes = math.ceil(width * bits_per_pixel / 8)
@@ -400,6 +727,7 @@ local function unfilter_scanlines(data, width, height, bits_per_pixel)
     return rows
 end
 
+-- Decode parsed PNG state into RGB bytes plus an optional alpha plane.
 local function decode_png_pixels(png)
     local channel_count_by_color = {
         [0] = 1,
@@ -524,6 +852,7 @@ local function decode_png_pixels(png)
     return rgb_data, alpha_data
 end
 
+-- Parse PNG chunks and collect the metadata needed for raster decoding.
 local function parse_png(data)
     local signature = "\137PNG\r\n\26\n"
     if data:sub(1, 8) ~= signature then
@@ -597,6 +926,7 @@ end
 local Page = {}
 Page.__index = Page
 
+-- Create a lightweight page buffer before it is serialized into the final PDF.
 function Page.new(width, height)
     return setmetatable({
         width = width,
@@ -612,15 +942,18 @@ function Page.new(width, height)
     }, Page)
 end
 
+-- Append a drawing command or text fragment to the page content stream.
 function Page:add_content(content)
     table.insert(self.contents, content)
 end
 
+-- Concatenate the page's buffered operations into one content stream payload.
 function Page:get_content_stream()
     return table.concat(self.contents, "\n")
 end
 
 -- Main PDF Document class
+-- Create a new document with empty registries and sensible defaults.
 function PDF.new()
     return setmetatable({
         pages = {},
@@ -648,6 +981,7 @@ function PDF.new()
     }, PDF)
 end
 
+-- Update standard metadata fields and retain custom Info dictionary entries.
 function PDF:set_metadata(metadata)
     if type(metadata) ~= "table" then
         error("set_metadata requires a metadata table.")
@@ -673,6 +1007,7 @@ function PDF:set_metadata(metadata)
     end
 end
 
+-- Render document metadata into the PDF Info dictionary syntax.
 function PDF:_build_info_dictionary()
     local entries = {
         "Title", self.title,
@@ -704,6 +1039,7 @@ function PDF:_build_info_dictionary()
     return table.concat(parts)
 end
 
+-- Add a page and make it the active canvas for subsequent operations.
 function PDF:add_page(width, height, orientation)
     orientation = orientation or "P"
     
@@ -719,6 +1055,7 @@ function PDF:add_page(width, height, orientation)
     return page
 end
 
+-- Select the active font family/style/size for future text operations.
 function PDF:set_font(family, style, size)
     style = style or ""
     size = size or 12
@@ -737,6 +1074,7 @@ function PDF:set_font(family, style, size)
     self.current_font_size = size
 end
 
+-- Translate friendly font arguments into the standard PDF base-font names.
 function PDF:_get_base_font_name(family, style)
     local fonts = {
         Helvetica = "Helvetica",
@@ -757,6 +1095,7 @@ function PDF:_get_base_font_name(family, style)
     return base
 end
 
+-- Draw text at a point or inside a wrapped column and return rendered height.
 function PDF:text(x, y, text, width, align)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -814,6 +1153,7 @@ function PDF:text(x, y, text, width, align)
     return (#lines * line_height_pt) / 2.83464567
 end
 
+-- Normalize line endings before wrapping or explicit multi-line output.
 function PDF:_split_text_lines(text)
     local raw_text = tostring(text or "")
     local normalized = raw_text:gsub("\r\n", "\n"):gsub("\r", "\n")
@@ -827,6 +1167,7 @@ function PDF:_split_text_lines(text)
     return lines
 end
 
+-- Wrap plain text so each emitted line fits within a millimeter width.
 function PDF:_wrap_text_lines(text, width_mm, font_size)
     local max_width_pt = mm_to_pt(width_mm)
     local wrapped = {}
@@ -867,6 +1208,7 @@ function PDF:_wrap_text_lines(text, width_mm, font_size)
     return wrapped
 end
 
+-- Assign compact resource names like /F1 and /F2 for embedded fonts.
 function PDF:_get_font_index(font_key)
     if not self._font_indices then
         self._font_indices = {}
@@ -883,6 +1225,7 @@ function PDF:_get_font_index(font_key)
     return self._font_indices[font_key]
 end
 
+-- Estimate text width heuristically for wrapping and alignment decisions.
 function PDF:_estimate_text_width_pt(text, font_size)
     local family = "Helvetica"
     local style = ""
@@ -910,6 +1253,7 @@ function PDF:_estimate_text_width_pt(text, font_size)
     return #tostring(text) * font_size * factor
 end
 
+-- Estimate ascent so top-left input coordinates map to PDF text baselines.
 function PDF:_estimate_text_ascent_pt(font_size)
     local family = "Helvetica"
     
@@ -927,6 +1271,7 @@ function PDF:_estimate_text_ascent_pt(font_size)
     return font_size * factor
 end
 
+-- Escape literal-string characters that have special meaning in PDF syntax.
 function PDF:_escape_text(text)
     text = text:gsub("\\", "\\\\")
     text = text:gsub("%(", "\\(")
@@ -934,6 +1279,7 @@ function PDF:_escape_text(text)
     return text
 end
 
+-- Forms always reference a shared Helvetica resource for widget appearance hints.
 function PDF:_ensure_form_font()
     local font_key = "Helvetica-"
     if not self.fonts[font_key] then
@@ -946,6 +1292,7 @@ function PDF:_ensure_form_font()
     return font_key
 end
 
+-- Attach a form widget definition to the current page and document registry.
 function PDF:_register_form_field(field)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -960,6 +1307,7 @@ function PDF:_register_form_field(field)
     return field
 end
 
+-- Attach a non-form annotation to the current page and document registry.
 function PDF:_register_annotation(annotation)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -974,6 +1322,7 @@ function PDF:_register_annotation(annotation)
     return annotation
 end
 
+-- Convert a top-left millimeter rectangle into PDF point coordinates.
 function PDF:_field_rect(x, y, width, height)
     local x1 = mm_to_pt(x)
     local y1 = self.current_page.height * 2.83464567 - mm_to_pt(y + height)
@@ -982,6 +1331,7 @@ function PDF:_field_rect(x, y, width, height)
     return x1, y1, x2, y2
 end
 
+-- Build PDF field flags for text widgets from the supported option set.
 function PDF:_build_text_field_flags(options)
     local flags = 0
     if options.read_only then
@@ -1005,6 +1355,7 @@ function PDF:_build_text_field_flags(options)
     return flags
 end
 
+-- Build the shared subset of field flags used by multiple widget types.
 function PDF:_build_common_field_flags(options)
     local flags = 0
     if options.read_only then
@@ -1016,6 +1367,7 @@ function PDF:_build_common_field_flags(options)
     return flags
 end
 
+-- Build PDF field flags for combo/list widgets from the supported option set.
 function PDF:_build_choice_field_flags(options)
     local flags = self:_build_common_field_flags(options)
     if options.combo then
@@ -1039,10 +1391,12 @@ function PDF:_build_choice_field_flags(options)
     return flags
 end
 
+-- Emit a value as a PDF literal string object.
 function PDF:_pdf_literal(value)
     return "(" .. self:_escape_text(tostring(value or "")) .. ")"
 end
 
+-- Emit an array of values as a PDF string array.
 function PDF:_pdf_string_array(values)
     local parts = {}
     for i = 1, #values do
@@ -1051,6 +1405,7 @@ function PDF:_pdf_string_array(values)
     return "[" .. table.concat(parts, " ") .. "]"
 end
 
+-- Draw the appearance stream used for checkbox on/off states.
 function PDF:_build_checkbox_appearance(width_pt, height_pt, checked)
     local inset = math.max(math.min(width_pt, height_pt) * 0.18, 2)
     local stroke = math.max(math.min(width_pt, height_pt) * 0.08, 1)
@@ -1074,6 +1429,7 @@ function PDF:_build_checkbox_appearance(width_pt, height_pt, checked)
     return table.concat(parts, "\n")
 end
 
+-- Draw the appearance stream used for radio-button on/off states.
 function PDF:_build_radio_appearance(width_pt, height_pt, checked)
     local radius = math.min(width_pt, height_pt) * 0.5
     local cx = width_pt * 0.5
@@ -1108,6 +1464,7 @@ function PDF:_build_radio_appearance(width_pt, height_pt, checked)
     return table.concat(parts, "\n")
 end
 
+-- Create a text widget and register it with the current AcroForm.
 function PDF:form_text(x, y, width, height, name, options)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1150,6 +1507,7 @@ function PDF:form_text(x, y, width, height, name, options)
     })
 end
 
+-- Create a checkbox widget and register it with the current AcroForm.
 function PDF:form_checkbox(x, y, size, name, checked, options)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1173,6 +1531,7 @@ function PDF:form_checkbox(x, y, size, name, checked, options)
     })
 end
 
+-- Create a combo-box widget and register it with the current AcroForm.
 function PDF:form_combo(x, y, width, height, name, choices, options)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1225,6 +1584,7 @@ function PDF:form_combo(x, y, width, height, name, choices, options)
     })
 end
 
+-- Create a list-box widget and register it with the current AcroForm.
 function PDF:form_list(x, y, width, height, name, choices, options)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1284,6 +1644,7 @@ function PDF:form_list(x, y, width, height, name, choices, options)
     })
 end
 
+-- Create an unsigned signature field container.
 function PDF:form_signature(x, y, width, height, name, options)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1312,6 +1673,7 @@ function PDF:form_signature(x, y, width, height, name, options)
     })
 end
 
+-- Create one radio widget that belongs to a shared radio group.
 function PDF:form_radio(x, y, size, group_name, option_name, checked, options)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1340,6 +1702,7 @@ function PDF:form_radio(x, y, size, group_name, option_name, checked, options)
     })
 end
 
+-- Add an external URL annotation over a rectangle on the page.
 function PDF:link(x, y, width, height, url, options)
     if not url or url == "" then
         error("link requires a URL.")
@@ -1355,6 +1718,7 @@ function PDF:link(x, y, width, height, url, options)
     })
 end
 
+-- Add a text-note annotation with optional title, icon, and color.
 function PDF:note(x, y, width, height, contents, options)
     if not contents or contents == "" then
         error("note requires contents.")
@@ -1373,6 +1737,7 @@ function PDF:note(x, y, width, height, contents, options)
     })
 end
 
+-- Draw a rectangle directly into the current page content stream.
 function PDF:rect(x, y, width, height, style)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1398,6 +1763,7 @@ function PDF:rect(x, y, width, height, style)
     self.current_page:add_content(content)
 end
 
+-- Approximate a circle with Bezier curves and emit it to the page stream.
 function PDF:circle(x, y, radius, style)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1434,6 +1800,7 @@ function PDF:circle(x, y, radius, style)
     self.current_page:add_content(content)
 end
 
+-- Draw a straight line between two points.
 function PDF:line(x1, y1, x2, y2)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1450,6 +1817,7 @@ function PDF:line(x1, y1, x2, y2)
     self.current_page:add_content(content)
 end
 
+-- Decode PNG bytes into a cached image resource entry usable by the PDF writer.
 function PDF:_decode_png_image_data(data, cache_key)
     if cache_key and self.image_cache[cache_key] then
         return self.image_cache[cache_key]
@@ -1475,6 +1843,7 @@ function PDF:_decode_png_image_data(data, cache_key)
     return image
 end
 
+-- Load a PNG from disk and reuse cached decode results when available.
 function PDF:_load_png_image(path)
     if self.image_cache[path] then
         return self.image_cache[path]
@@ -1490,6 +1859,7 @@ function PDF:_load_png_image(path)
     return self:_decode_png_image_data(data, path)
 end
 
+-- Place a PNG from disk on the current page.
 function PDF:image_png(path, x, y, width, height)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1512,6 +1882,7 @@ function PDF:image_png(path, x, y, width, height)
     ))
 end
 
+-- Place a PNG from an in-memory byte string on the current page.
 function PDF:image_png_data(data, x, y, width, height, cache_key)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1534,6 +1905,7 @@ function PDF:image_png_data(data, x, y, width, height, cache_key)
     ))
 end
 
+-- Set the current fill color and immediately emit it when a page is active.
 function PDF:set_color_fill(r, g, b, a)
     a = a or 1
     
@@ -1548,6 +1920,7 @@ function PDF:set_color_fill(r, g, b, a)
     end
 end
 
+-- Set the current stroke color and immediately emit it when a page is active.
 function PDF:set_color_stroke(r, g, b, a)
     a = a or 1
     
@@ -1562,6 +1935,7 @@ function PDF:set_color_stroke(r, g, b, a)
     end
 end
 
+-- Set the current stroke width in millimeters.
 function PDF:set_line_width(width)
     self.current_line_width = width
     
@@ -1571,6 +1945,7 @@ function PDF:set_line_width(width)
     end
 end
 
+-- Serialize every collected page, resource, form, and annotation into one PDF file.
 function PDF:save(filename)
     local file = io.open(filename, "wb")
     if not file then
@@ -1596,22 +1971,27 @@ function PDF:save(filename)
     for _, image in ipairs(self.images) do
         if image.alpha_data then
             smask_refs[image.name] = obj_num
-            local smask_stream = "stream\n" .. image.alpha_data .. "\nendstream"
-            objects[obj_num] = "<</Type /XObject /Subtype /Image /Width " .. image.width ..
-                               " /Height " .. image.height ..
-                               " /ColorSpace /DeviceGray /BitsPerComponent 8 /Length " ..
-                               #image.alpha_data .. ">>\n" .. smask_stream
+            objects[obj_num] = build_stream_object(
+                "/Type /XObject /Subtype /Image /Width " .. image.width ..
+                " /Height " .. image.height ..
+                " /ColorSpace /DeviceGray /BitsPerComponent 8",
+                image.alpha_data,
+                self.compression
+            )
             obj_num = obj_num + 1
         end
 
         image_refs[image.name] = obj_num
         local smask_part = smask_refs[image.name] and (" /SMask " .. smask_refs[image.name] .. " 0 R") or ""
-        local image_stream = "stream\n" .. image.data .. "\nendstream"
-        objects[obj_num] = "<</Type /XObject /Subtype /Image /Width " .. image.width ..
-                           " /Height " .. image.height ..
-                           " /ColorSpace " .. image.color_space ..
-                           " /BitsPerComponent " .. image.bits_per_component ..
-                           smask_part .. " /Length " .. #image.data .. ">>\n" .. image_stream
+        objects[obj_num] = build_stream_object(
+            "/Type /XObject /Subtype /Image /Width " .. image.width ..
+            " /Height " .. image.height ..
+            " /ColorSpace " .. image.color_space ..
+            " /BitsPerComponent " .. image.bits_per_component ..
+            smask_part,
+            image.data,
+            self.compression
+        )
         obj_num = obj_num + 1
     end
     
@@ -1740,8 +2120,7 @@ function PDF:save(filename)
         
         -- Content stream object
         local stream_data = page:get_content_stream()
-        local stream_obj = "stream\n" .. stream_data .. "\nendstream"
-        objects[content_obj_num] = "<</Length " .. #stream_data .. ">>\n" .. stream_obj
+        objects[content_obj_num] = build_stream_object("", stream_data, self.compression)
     end
 
     if acroform_ref then
@@ -1803,20 +2182,26 @@ function PDF:save(filename)
                 local appearance_refs = checkbox_appearance_refs[field_idx]
                 local flags = self:_build_common_field_flags(field)
                 local state_name = field.checked and "/Yes" or "/Off"
+                local off_appearance = self:_build_checkbox_appearance(field.width_pt, field.height_pt, false)
+                local on_appearance = self:_build_checkbox_appearance(field.width_pt, field.height_pt, true)
 
-                objects[appearance_refs.off] = string.format(
-                    "<</Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>> /Length %d>>\nstream\n%s\nendstream",
-                    field.width_pt,
-                    field.height_pt,
-                    #self:_build_checkbox_appearance(field.width_pt, field.height_pt, false),
-                    self:_build_checkbox_appearance(field.width_pt, field.height_pt, false)
+                objects[appearance_refs.off] = build_stream_object(
+                    string.format(
+                        "/Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>>",
+                        field.width_pt,
+                        field.height_pt
+                    ),
+                    off_appearance,
+                    self.compression
                 )
-                objects[appearance_refs.yes] = string.format(
-                    "<</Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>> /Length %d>>\nstream\n%s\nendstream",
-                    field.width_pt,
-                    field.height_pt,
-                    #self:_build_checkbox_appearance(field.width_pt, field.height_pt, true),
-                    self:_build_checkbox_appearance(field.width_pt, field.height_pt, true)
+                objects[appearance_refs.yes] = build_stream_object(
+                    string.format(
+                        "/Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>>",
+                        field.width_pt,
+                        field.height_pt
+                    ),
+                    on_appearance,
+                    self.compression
                 )
 
                 objects[field_refs[field_idx]] = string.format(
@@ -1884,19 +2269,23 @@ function PDF:save(filename)
                 local off_stream = self:_build_radio_appearance(field.width_pt, field.height_pt, false)
                 local on_stream = self:_build_radio_appearance(field.width_pt, field.height_pt, true)
 
-                objects[appearance_refs.off] = string.format(
-                    "<</Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>> /Length %d>>\nstream\n%s\nendstream",
-                    field.width_pt,
-                    field.height_pt,
-                    #off_stream,
-                    off_stream
+                objects[appearance_refs.off] = build_stream_object(
+                    string.format(
+                        "/Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>>",
+                        field.width_pt,
+                        field.height_pt
+                    ),
+                    off_stream,
+                    self.compression
                 )
-                objects[appearance_refs.yes] = string.format(
-                    "<</Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>> /Length %d>>\nstream\n%s\nendstream",
-                    field.width_pt,
-                    field.height_pt,
-                    #on_stream,
-                    on_stream
+                objects[appearance_refs.yes] = build_stream_object(
+                    string.format(
+                        "/Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>>",
+                        field.width_pt,
+                        field.height_pt
+                    ),
+                    on_stream,
+                    self.compression
                 )
 
                 objects[field_refs[field_idx]] = string.format(
@@ -1996,6 +2385,7 @@ function Utils.mm_to_in(mm)
     return mm / 25.4
 end
 
+-- Common paper sizes exposed as convenience constants.
 Utils.PaperSizes = {
     A0 = {width = 841, height = 1189},
     A1 = {width = 594, height = 841},
@@ -2009,6 +2399,7 @@ Utils.PaperSizes = {
     Tabloid = {width = 279.4, height = 431.8},
 }
 
+-- Named RGB colors for quick examples and helper usage.
 Utils.Colors = {
     black = {0, 0, 0},
     white = {255, 255, 255},
@@ -2026,6 +2417,7 @@ Utils.Colors = {
     brown = {165, 42, 42},
 }
 
+-- Standard PDF fonts supported by the built-in font mapping.
 Utils.StandardFonts = {
     "Helvetica",
     "Helvetica-Bold",
@@ -2041,6 +2433,7 @@ Utils.StandardFonts = {
     "Courier-BoldOblique",
 }
 
+-- Escape a string for safe use in PDF literal syntax.
 function Utils.escape_pdf_text(text)
     text = tostring(text)
     text = text:gsub("\\", "\\\\")
@@ -2049,6 +2442,7 @@ function Utils.escape_pdf_text(text)
     return text
 end
 
+-- Reverse the literal-string escaping used by escape_pdf_text.
 function Utils.unescape_pdf_text(text)
     text = tostring(text)
     text = text:gsub("\\%)", ")")
@@ -2057,6 +2451,7 @@ function Utils.unescape_pdf_text(text)
     return text
 end
 
+-- Split text on a simple delimiter, defaulting to newline.
 function Utils.split_text(text, delimiter)
     delimiter = delimiter or "\n"
     local lines = {}
@@ -2066,15 +2461,18 @@ function Utils.split_text(text, delimiter)
     return lines
 end
 
+-- Expose a simple width estimate without requiring a document instance.
 function Utils.estimate_text_width(text, font_size)
     font_size = font_size or 12
     return #tostring(text) * 0.5 * font_size
 end
 
+-- Convert RGB components to a CSS-style hex string.
 function Utils.rgb_to_hex(r, g, b)
     return string.format("#%02X%02X%02X", r, g, b)
 end
 
+-- Convert a hex color string into integer RGB components.
 function Utils.hex_to_rgb(hex)
     hex = hex:gsub("#", "")
     local r = tonumber(hex:sub(1, 2), 16)
@@ -2083,6 +2481,7 @@ function Utils.hex_to_rgb(hex)
     return r, g, b
 end
 
+-- Convert HSV values to 0..255 RGB components.
 function Utils.hsv_to_rgb(h, s, v)
     local c = v * s
     local hp = h / 60
@@ -2107,6 +2506,7 @@ function Utils.hsv_to_rgb(h, s, v)
     return (r + m) * 255, (g + m) * 255, (b + m) * 255
 end
 
+-- Convert 0..255 RGB components into HSV values.
 function Utils.rgb_to_hsv(r, g, b)
     r = r / 255
     g = g / 255
@@ -2132,6 +2532,7 @@ function Utils.rgb_to_hsv(r, g, b)
     return h, s, v
 end
 
+-- Generate an interpolated RGB gradient between two colors.
 function Utils.color_gradient(color1, color2, steps)
     steps = steps or 10
     local gradient = {}
@@ -2146,23 +2547,28 @@ function Utils.color_gradient(color1, color2, steps)
     return gradient
 end
 
+-- Format a number with a fixed number of decimal places.
 function Utils.format_number(num, decimals)
     decimals = decimals or 2
     return string.format("%." .. decimals .. "f", num)
 end
 
+-- Return a timestamp in the canonical PDF date format.
 function Utils.get_pdf_timestamp()
     return os.date("D:%Y%m%d%H%M%S")
 end
 
+-- Convert degrees to radians.
 function Utils.degrees_to_radians(degrees)
     return degrees * math.pi / 180
 end
 
+-- Convert radians to degrees.
 function Utils.radians_to_degrees(radians)
     return radians * 180 / math.pi
 end
 
+-- Draw a full-width report-style header and return the next suggested y-position.
 function Helper.add_header(doc, title, subtitle)
     doc:set_color_fill(44, 62, 80)
     doc:rect(0, 0, doc.current_page.width, 30, "F")
@@ -2180,6 +2586,7 @@ function Helper.add_header(doc, title, subtitle)
     return 35
 end
 
+-- Draw a footer with the page number and, optionally, the current date.
 function Helper.add_footer(doc, show_date)
     show_date = show_date ~= false
 
@@ -2195,6 +2602,7 @@ function Helper.add_footer(doc, show_date)
     end
 end
 
+-- Draw a section title with a thin divider line beneath it.
 function Helper.section_header(doc, text, y)
     doc:set_color_fill(52, 152, 219)
     doc:rect(10, y, doc.current_page.width - 20, 0.5, "F")
@@ -2206,6 +2614,7 @@ function Helper.section_header(doc, text, y)
     return y + 10
 end
 
+-- Draw a simple filled callout box with text inside it.
 function Helper.highlight_box(doc, x, y, width, height, text, bgcolor, textcolor)
     bgcolor = bgcolor or {236, 240, 241}
     textcolor = textcolor or {0, 0, 0}
@@ -2218,6 +2627,7 @@ function Helper.highlight_box(doc, x, y, width, height, text, bgcolor, textcolor
     doc:text(x + 5, y + 5, text)
 end
 
+-- Draw a plain outlined box helper.
 function Helper.box(doc, x, y, width, height, border_color, border_width)
     border_color = border_color or {0, 0, 0}
     border_width = border_width or 0.5
@@ -2227,6 +2637,7 @@ function Helper.box(doc, x, y, width, height, border_color, border_width)
     doc:rect(x, y, width, height, "S")
 end
 
+-- Create a title page with large typography and optional supporting lines.
 function Helper.title_page(doc, title, subtitle, content_lines)
     local page_width = 210
     local page_height = 297
@@ -2265,6 +2676,7 @@ function Helper.title_page(doc, title, subtitle, content_lines)
     end
 end
 
+-- Add a new page and optionally seed it with a standard header.
 function Helper.page_break(doc, page_width, page_height, with_header)
     doc:add_page(page_width, page_height)
     if with_header then
@@ -2273,6 +2685,7 @@ function Helper.page_break(doc, page_width, page_height, with_header)
     return 10
 end
 
+-- Lay out two columns of labeled text content side by side.
 function Helper.two_column_layout(doc, left_title, left_content, right_title, right_content, y)
     local col_width = (doc.current_page.width - 30) / 2
     local col_x1 = 10
@@ -2301,6 +2714,7 @@ function Helper.two_column_layout(doc, left_title, left_content, right_title, ri
     return math.max(left_y, right_y) + 10
 end
 
+-- Draw a watermark string; opacity is accepted for API symmetry but not emitted as PDF transparency.
 function Helper.watermark(doc, text, opacity)
     opacity = opacity or 0.1
     doc:set_color_fill(200, 200, 200, opacity)
@@ -2308,6 +2722,7 @@ function Helper.watermark(doc, text, opacity)
     doc:text(doc.current_page.width / 2 - 50, doc.current_page.height / 2 - 30, text)
 end
 
+-- Draw a checklist row with a visual checkbox and text label.
 function Helper.checklist_item(doc, x, y, text, checked)
     local box_size = 4
     doc:set_color_stroke(0, 0, 0)
@@ -2325,6 +2740,7 @@ function Helper.checklist_item(doc, x, y, text, checked)
     doc:text(x + 8, y + 0.5, text)
 end
 
+-- Draw a horizontal progress bar using a background track and filled segment.
 function Helper.progress_bar(doc, x, y, width, height, percentage, color)
     color = color or {52, 152, 219}
     doc:set_color_fill(200, 200, 200)

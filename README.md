@@ -101,6 +101,7 @@ doc:save("output.pdf")
 
 `PDF.new()`
 - Creates a new document object.
+- Stream compression is enabled by default; set `doc.compression = false` before `save()` to write raw streams instead
 
 Common document metadata fields are available as direct properties:
 - `doc.title`
@@ -293,9 +294,9 @@ doc:form_signature(10, 120, 90, 18, "customer_signature")
 
 doc:text(110, 60, "Plan")
 doc:form_radio(110, 64, 6, "plan_tier", "Basic", false)
-doc:text(118, 64, "Basic")
+doc:text(118, 66, "Basic")
 doc:form_radio(110, 74, 6, "plan_tier", "Pro", true)
-doc:text(118, 74, "Pro")
+doc:text(118, 76, "Pro")
 ```
 
 `doc:form_text(x, y, width, height, name, [options])`
