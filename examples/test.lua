@@ -205,11 +205,41 @@ doc:text(118, 46, "High")
 assert(#doc.forms == 9, "Should have 9 form fields")
 print("✓ Form field definitions recorded")
 
--- Test 12: PDF generation
-print("\nTest 12: Generating PDF file...")
+-- Test 12: Wrapping and annotations
+print("\nTest 12: Testing wrapping and annotations...")
+doc:add_page(210, 297)
+doc:set_font("Helvetica", "", 12)
+doc:set_color_fill(0, 0, 0)
+local wrapped_height = doc:text(10, 10,
+    "This is a long sentence that should wrap across multiple lines when a width is supplied to the text renderer.",
+    55, "L")
+assert(wrapped_height > 6, "Wrapped text should consume more than one line of height")
+doc:text(10, 40, "Link target")
+doc:link(10, 40, 25, 6, "https://example.com")
+doc:note(40, 40, 8, 8, "Review this section", {
+    title = "Reviewer",
+    icon = "Comment",
+})
+assert(#doc.annotations == 2, "Should have 2 non-form annotations")
+print("✓ Wrapping and annotations recorded")
+
+-- Test 13: Metadata
+print("\nTest 13: Testing metadata...")
 doc.title = "Test Document"
 doc.author = "Lua PDF Test Suite"
 doc.subject = "Testing the PDF library"
+doc.keywords = "test, pdf, lua"
+doc:set_metadata({
+    creator = "examples/test.lua",
+    producer = "Lua PDF Test Suite",
+    Department = "QA",
+})
+assert(doc.creator == "examples/test.lua", "Metadata creator should be updated")
+assert(doc.metadata.Department == "QA", "Custom metadata should be stored")
+print("✓ Metadata fields recorded")
+
+-- Test 14: PDF generation
+print("\nTest 14: Generating PDF file...")
 
 local success, error_msg = pcall(function()
     doc:save("test_output.pdf")
@@ -221,6 +251,7 @@ if success then
     -- Check if file exists
     local file = io.open("test_output.pdf", "rb")
     if file then
+        local contents = file:read("*all")
         local size = file:seek("end")
         file:close()
         print("  • File size: " .. size .. " bytes")
@@ -228,6 +259,13 @@ if success then
         if size > 500 then
             print("✓ File size is reasonable")
         end
+
+        assert(contents:find("/Keywords %(test, pdf, lua%)", 1), "PDF should include keywords metadata")
+        assert(contents:find("/Creator %(examples/test.lua%)", 1), "PDF should include creator metadata")
+        assert(contents:find("/Department %(QA%)", 1), "PDF should include custom metadata")
+        assert(contents:find("/Subtype /Link", 1), "PDF should include a link annotation")
+        assert(contents:find("/Subtype /Text", 1), "PDF should include a text annotation")
+        print("✓ Metadata written to PDF")
     else
         print("✗ File was not created")
     end

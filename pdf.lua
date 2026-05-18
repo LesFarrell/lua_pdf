@@ -627,6 +627,7 @@ function PDF.new()
         fonts = {},
         images = {},
         image_cache = {},
+        annotations = {},
         current_page = nil,
         current_font = nil,
         current_font_size = 12,
@@ -638,8 +639,69 @@ function PDF.new()
         title = "Untitled",
         author = "Lua PDF Library",
         subject = "",
-        created = os.date("D:%Y%m%d%H%M%S")
+        keywords = "",
+        creator = "Lua PDF Library",
+        producer = "Lua PDF Library",
+        created = os.date("D:%Y%m%d%H%M%S"),
+        modified = os.date("D:%Y%m%d%H%M%S"),
+        metadata = {},
     }, PDF)
+end
+
+function PDF:set_metadata(metadata)
+    if type(metadata) ~= "table" then
+        error("set_metadata requires a metadata table.")
+    end
+
+    local direct_fields = {
+        title = true,
+        author = true,
+        subject = true,
+        keywords = true,
+        creator = true,
+        producer = true,
+        created = true,
+        modified = true,
+    }
+
+    for key, value in pairs(metadata) do
+        if direct_fields[key] then
+            self[key] = tostring(value or "")
+        else
+            self.metadata[key] = tostring(value or "")
+        end
+    end
+end
+
+function PDF:_build_info_dictionary()
+    local entries = {
+        "Title", self.title,
+        "Author", self.author,
+        "Subject", self.subject,
+        "Keywords", self.keywords,
+        "Creator", self.creator,
+        "Producer", self.producer,
+        "CreationDate", self.created,
+        "ModDate", self.modified,
+    }
+
+    local parts = {"<<"}
+    for i = 1, #entries, 2 do
+        local key = entries[i]
+        local value = entries[i + 1]
+        if value ~= nil and value ~= "" then
+            parts[#parts + 1] = " /" .. key .. " (" .. self:_escape_text(value) .. ")"
+        end
+    end
+
+    for key, value in pairs(self.metadata) do
+        if value ~= nil and value ~= "" then
+            parts[#parts + 1] = " /" .. tostring(key) .. " (" .. self:_escape_text(value) .. ")"
+        end
+    end
+
+    parts[#parts + 1] = ">>"
+    return table.concat(parts)
 end
 
 function PDF:add_page(width, height, orientation)
@@ -702,47 +764,107 @@ function PDF:text(x, y, text, width, align)
     
     align = align or "L"
     width = width or 0
-    
-    -- Convert mm to points
-    local x_pt = mm_to_pt(x)
     local font_size = self.current_font_size
-    local text_width_pt = self:_estimate_text_width_pt(text, font_size)
     local text_ascent_pt = self:_estimate_text_ascent_pt(font_size)
-    local y_pt = self.current_page.height * 2.83464567 - mm_to_pt(y) - text_ascent_pt
-    
-    -- Generate font reference
     local font_name = "F" .. self:_get_font_index(self.current_font)
-    
-    -- Apply simple alignment. When width is omitted, treat x as the anchor point.
-    if align == "C" then
-        if width > 0 then
-            x_pt = x_pt + (mm_to_pt(width) - text_width_pt) / 2
-        else
-            x_pt = x_pt - text_width_pt / 2
-        end
-    elseif align == "R" then
-        if width > 0 then
-            x_pt = x_pt + mm_to_pt(width) - text_width_pt
-        else
-            x_pt = x_pt - text_width_pt
-        end
-    end
-    
-    -- Build content stream command with explicit color and correct PDF order
-    -- Include text color (default black: 0 0 0) using rg operator
     local color_r = self.current_color_fill[1] or 0
     local color_g = self.current_color_fill[2] or 0
     local color_b = self.current_color_fill[3] or 0
-    
-    local content = string.format("BT\n%.3f %.3f %.3f rg\n%.2f %.2f Td\n/%s %d Tf\n(%s) Tj\nET",
-        color_r, color_g, color_b, x_pt, y_pt, font_name, font_size, self:_escape_text(text))
-    
+
+    local lines
     if width > 0 then
-        -- Text wrapping would go here
-        -- For now, simple text placement
+        lines = self:_wrap_text_lines(text, width, font_size)
+    else
+        lines = self:_split_text_lines(text)
     end
-    
-    self.current_page:add_content(content)
+
+    local page_height_pt = self.current_page.height * 2.83464567
+    local line_height_pt = font_size * 1.2
+    local content_lines = {
+        "BT",
+        string.format("%.3f %.3f %.3f rg", color_r, color_g, color_b),
+        string.format("/%s %d Tf", font_name, font_size),
+    }
+
+    for line_index, line in ipairs(lines) do
+        local x_pt = mm_to_pt(x)
+        local text_width_pt = self:_estimate_text_width_pt(line, font_size)
+
+        if align == "C" then
+            if width > 0 then
+                x_pt = x_pt + (mm_to_pt(width) - text_width_pt) / 2
+            else
+                x_pt = x_pt - text_width_pt / 2
+            end
+        elseif align == "R" then
+            if width > 0 then
+                x_pt = x_pt + mm_to_pt(width) - text_width_pt
+            else
+                x_pt = x_pt - text_width_pt
+            end
+        end
+
+        local y_pt = page_height_pt - mm_to_pt(y) - text_ascent_pt - ((line_index - 1) * line_height_pt)
+        content_lines[#content_lines + 1] = string.format("%.2f %.2f Td", x_pt, y_pt)
+        content_lines[#content_lines + 1] = string.format("(%s) Tj", self:_escape_text(line))
+    end
+
+    content_lines[#content_lines + 1] = "ET"
+    self.current_page:add_content(table.concat(content_lines, "\n"))
+    return (#lines * line_height_pt) / 2.83464567
+end
+
+function PDF:_split_text_lines(text)
+    local raw_text = tostring(text or "")
+    local normalized = raw_text:gsub("\r\n", "\n"):gsub("\r", "\n")
+    local lines = {}
+    for line in (normalized .. "\n"):gmatch("(.-)\n") do
+        lines[#lines + 1] = line
+    end
+    if #lines == 0 then
+        lines[1] = ""
+    end
+    return lines
+end
+
+function PDF:_wrap_text_lines(text, width_mm, font_size)
+    local max_width_pt = mm_to_pt(width_mm)
+    local wrapped = {}
+
+    for _, paragraph in ipairs(self:_split_text_lines(text)) do
+        if paragraph == "" then
+            wrapped[#wrapped + 1] = ""
+        else
+            local current = ""
+            for word in paragraph:gmatch("%S+") do
+                local candidate = current == "" and word or (current .. " " .. word)
+                if self:_estimate_text_width_pt(candidate, font_size) <= max_width_pt then
+                    current = candidate
+                elseif current == "" then
+                    local chunk = ""
+                    for i = 1, #word do
+                        local candidate_chunk = chunk .. word:sub(i, i)
+                        if chunk ~= "" and self:_estimate_text_width_pt(candidate_chunk, font_size) > max_width_pt then
+                            wrapped[#wrapped + 1] = chunk
+                            chunk = word:sub(i, i)
+                        else
+                            chunk = candidate_chunk
+                        end
+                    end
+                    current = chunk
+                else
+                    wrapped[#wrapped + 1] = current
+                    current = word
+                end
+            end
+            wrapped[#wrapped + 1] = current
+        end
+    end
+
+    if #wrapped == 0 then
+        wrapped[1] = ""
+    end
+    return wrapped
 end
 
 function PDF:_get_font_index(font_key)
@@ -831,8 +953,25 @@ function PDF:_register_form_field(field)
 
     field.page_index = self.current_page.index
     table.insert(self.forms, field)
-    table.insert(self.current_page.annotations, #self.forms)
+    table.insert(self.current_page.annotations, {
+        kind = "form",
+        index = #self.forms,
+    })
     return field
+end
+
+function PDF:_register_annotation(annotation)
+    if not self.current_page then
+        error("No page added. Call add_page first.")
+    end
+
+    annotation.page_index = self.current_page.index
+    table.insert(self.annotations, annotation)
+    table.insert(self.current_page.annotations, {
+        kind = "annotation",
+        index = #self.annotations,
+    })
+    return annotation
 end
 
 function PDF:_field_rect(x, y, width, height)
@@ -1201,6 +1340,39 @@ function PDF:form_radio(x, y, size, group_name, option_name, checked, options)
     })
 end
 
+function PDF:link(x, y, width, height, url, options)
+    if not url or url == "" then
+        error("link requires a URL.")
+    end
+
+    options = options or {}
+    local x1, y1, x2, y2 = self:_field_rect(x, y, width, height)
+    return self:_register_annotation({
+        annotation_type = "link",
+        url = tostring(url),
+        rect = {x1, y1, x2, y2},
+        border_width = options.border_width or 0,
+    })
+end
+
+function PDF:note(x, y, width, height, contents, options)
+    if not contents or contents == "" then
+        error("note requires contents.")
+    end
+
+    options = options or {}
+    local x1, y1, x2, y2 = self:_field_rect(x, y, width, height)
+    return self:_register_annotation({
+        annotation_type = "text",
+        contents = tostring(contents),
+        title = tostring(options.title or ""),
+        open = options.open and true or false,
+        icon = tostring(options.icon or "Note"),
+        color = options.color or {1, 1, 0},
+        rect = {x1, y1, x2, y2},
+    })
+end
+
 function PDF:rect(x, y, width, height, style)
     if not self.current_page then
         error("No page added. Call add_page first.")
@@ -1456,6 +1628,7 @@ function PDF:save(filename)
     local radio_group_refs = {}
     local radio_group_order = {}
     local radio_appearance_refs = {}
+    local annotation_refs = {}
     if #self.forms > 0 then
         self:_ensure_form_font()
         acroform_ref = obj_num
@@ -1501,6 +1674,10 @@ function PDF:save(filename)
             end
         end
     end
+    for annotation_idx = 1, #self.annotations do
+        annotation_refs[annotation_idx] = obj_num
+        obj_num = obj_num + 1
+    end
 
     -- Object 1: Catalog
     local catalog = "<</Type /Catalog /Pages 2 0 R"
@@ -1545,8 +1722,12 @@ function PDF:save(filename)
         local annots_part = ""
         if #page.annotations > 0 then
             local annot_refs = {}
-            for _, field_idx in ipairs(page.annotations) do
-                annot_refs[#annot_refs + 1] = field_refs[field_idx] .. " 0 R"
+            for _, page_annot in ipairs(page.annotations) do
+                if page_annot.kind == "form" then
+                    annot_refs[#annot_refs + 1] = field_refs[page_annot.index] .. " 0 R"
+                elseif page_annot.kind == "annotation" then
+                    annot_refs[#annot_refs + 1] = annotation_refs[page_annot.index] .. " 0 R"
+                end
             end
             annots_part = " /Annots [" .. table.concat(annot_refs, " ") .. "]"
         end
@@ -1731,12 +1912,37 @@ function PDF:save(filename)
             end
         end
     end
+
+    for annotation_idx, annotation in ipairs(self.annotations) do
+        local rect = string.format("[%.2f %.2f %.2f %.2f]",
+            annotation.rect[1], annotation.rect[2], annotation.rect[3], annotation.rect[4])
+
+        if annotation.annotation_type == "link" then
+            objects[annotation_refs[annotation_idx]] = string.format(
+                "<</Type /Annot /Subtype /Link /Rect %s /Border [0 0 %.2f] /A <</S /URI /URI (%s)>>>>",
+                rect,
+                annotation.border_width or 0,
+                self:_escape_text(annotation.url)
+            )
+        elseif annotation.annotation_type == "text" then
+            local color = annotation.color or {1, 1, 0}
+            local r, g, b = normalize_rgb(color[1] or 1, color[2] or 1, color[3] or 0)
+            local open_part = annotation.open and "true" or "false"
+            local title_part = annotation.title ~= "" and (" /T (" .. self:_escape_text(annotation.title) .. ")") or ""
+            objects[annotation_refs[annotation_idx]] = string.format(
+                "<</Type /Annot /Subtype /Text /Rect %s /Contents (%s)%s /Open %s /Name /%s /C [%.3f %.3f %.3f]>>",
+                rect,
+                self:_escape_text(annotation.contents),
+                title_part,
+                open_part,
+                self:_escape_text(annotation.icon),
+                r, g, b
+            )
+        end
+    end
     
     -- Info object
-    objects[obj_num] = "<</Title (" .. self:_escape_text(self.title) .. ") /Author (" .. 
-                       self:_escape_text(self.author) .. ") /Subject (" .. 
-                       self:_escape_text(self.subject) .. ") /CreationDate (" .. 
-                       self.created .. ")>>"
+    objects[obj_num] = self:_build_info_dictionary()
     local info_obj = obj_num
     
     -- Write PDF

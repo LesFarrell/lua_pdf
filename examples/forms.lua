@@ -5,6 +5,12 @@ local PDF = require("pdf")
 local doc = PDF.new()
 doc.title = "PDF Form Example"
 doc.author = "Lua PDF Library"
+doc:set_metadata({
+    subject = "Interactive PDF form example",
+    keywords = "forms, acroform, widgets",
+    creator = "examples/forms.lua",
+    Company = "Lua PDF Library",
+})
 
 doc:add_page(PDF.PaperSizes.A4.width, PDF.PaperSizes.A4.height)
 
