@@ -119,6 +119,59 @@ local function encode_utf16be(codepoints)
     return table.concat(parts)
 end
 
+local WINANSI_EXTRA_BYTES = {
+    [0x20AC] = 0x80,
+    [0x201A] = 0x82,
+    [0x0192] = 0x83,
+    [0x201E] = 0x84,
+    [0x2026] = 0x85,
+    [0x2020] = 0x86,
+    [0x2021] = 0x87,
+    [0x02C6] = 0x88,
+    [0x2030] = 0x89,
+    [0x0160] = 0x8A,
+    [0x2039] = 0x8B,
+    [0x0152] = 0x8C,
+    [0x017D] = 0x8E,
+    [0x2018] = 0x91,
+    [0x2019] = 0x92,
+    [0x201C] = 0x93,
+    [0x201D] = 0x94,
+    [0x2022] = 0x95,
+    [0x2013] = 0x96,
+    [0x2014] = 0x97,
+    [0x02DC] = 0x98,
+    [0x2122] = 0x99,
+    [0x0161] = 0x9A,
+    [0x203A] = 0x9B,
+    [0x0153] = 0x9C,
+    [0x017E] = 0x9E,
+    [0x0178] = 0x9F,
+}
+
+local function split_utf8_chars(text)
+    local chars = {}
+    local i = 1
+
+    while i <= #text do
+        local b1 = string.byte(text, i)
+        local length = 1
+
+        if b1 >= 0xC2 and b1 <= 0xDF then
+            length = 2
+        elseif b1 >= 0xE0 and b1 <= 0xEF then
+            length = 3
+        elseif b1 >= 0xF0 and b1 <= 0xF4 then
+            length = 4
+        end
+
+        chars[#chars + 1] = text:sub(i, i + length - 1)
+        i = i + length
+    end
+
+    return chars
+end
+
 local function reverse_bits(value, width)
     local reversed = 0
     for _ = 1, width do
@@ -1214,6 +1267,7 @@ function PDF:text(x, y, text, width, align)
 
     for line_index, line in ipairs(lines) do
         local x_pt = mm_to_pt(x)
+        local encoded_line = self:_encode_page_text(line)
         local text_width_pt = self:_estimate_text_width_pt(line, font_size)
 
         if align == "C" then
@@ -1232,7 +1286,7 @@ function PDF:text(x, y, text, width, align)
 
         local y_pt = page_height_pt - mm_to_pt(y) - text_ascent_pt - ((line_index - 1) * line_height_pt)
         content_lines[#content_lines + 1] = string.format("1 0 0 1 %.2f %.2f Tm", x_pt, y_pt)
-        content_lines[#content_lines + 1] = string.format("(%s) Tj", self:_escape_text(line))
+        content_lines[#content_lines + 1] = string.format("(%s) Tj", self:_escape_text(encoded_line))
     end
 
     content_lines[#content_lines + 1] = "ET"
@@ -1270,11 +1324,11 @@ function PDF:_wrap_text_lines(text, width_mm, font_size)
                     current = candidate
                 elseif current == "" then
                     local chunk = ""
-                    for i = 1, #word do
-                        local candidate_chunk = chunk .. word:sub(i, i)
+                    for _, character in ipairs(split_utf8_chars(word)) do
+                        local candidate_chunk = chunk .. character
                         if chunk ~= "" and self:_estimate_text_width_pt(candidate_chunk, font_size) > max_width_pt then
                             wrapped[#wrapped + 1] = chunk
-                            chunk = word:sub(i, i)
+                            chunk = character
                         else
                             chunk = candidate_chunk
                         end
@@ -1337,7 +1391,7 @@ function PDF:_estimate_text_width_pt(text, font_size)
         factor = factor + 0.04
     end
     
-    return #tostring(text) * font_size * factor
+    return #self:_encode_page_text(text) * font_size * factor
 end
 
 -- Estimate ascent so top-left input coordinates map to PDF text baselines.
@@ -1409,6 +1463,46 @@ function PDF:_pdf_text_string(value)
     end
 
     return "<" .. hex_encode(text) .. ">"
+end
+
+-- Encode displayed text for the built-in simple fonts using WinAnsi-compatible bytes.
+function PDF:_encode_page_text(value)
+    local text = tostring(value or "")
+    local ascii_only = true
+
+    for i = 1, #text do
+        if string.byte(text, i) > 0x7F then
+            ascii_only = false
+            break
+        end
+    end
+
+    if ascii_only then
+        return text
+    end
+
+    local codepoints = decode_utf8(text)
+    if not codepoints then
+        return text
+    end
+
+    local bytes = {}
+    for i = 1, #codepoints do
+        local codepoint = codepoints[i]
+        local mapped = WINANSI_EXTRA_BYTES[codepoint]
+
+        if codepoint >= 0x00 and codepoint <= 0x7F then
+            mapped = codepoint
+        elseif codepoint >= 0xA0 and codepoint <= 0xFF then
+            mapped = codepoint
+        elseif codepoint == 0x2028 or codepoint == 0x2029 then
+            mapped = 0x20
+        end
+
+        bytes[#bytes + 1] = string.char(mapped or 0x3F)
+    end
+
+    return table.concat(bytes)
 end
 
 -- Forms always reference a shared Helvetica resource for widget appearance hints.
@@ -1597,7 +1691,7 @@ function PDF:_build_radio_appearance(width_pt, height_pt, checked)
 end
 
 local function estimate_helvetica_width_pt(text, font_size)
-    return #tostring(text or "") * font_size * 0.52
+    return #text * font_size * 0.52
 end
 
 -- Build the visible appearance stream for text and choice widgets.
@@ -1656,7 +1750,8 @@ function PDF:_build_variable_text_appearance(field)
         end
 
         local x_pt = text_left
-        local text_width_pt = estimate_helvetica_width_pt(line, field.font_size)
+        local encoded_line = self:_encode_page_text(line)
+        local text_width_pt = estimate_helvetica_width_pt(encoded_line, field.font_size)
         if field.align == 1 then
             x_pt = text_left + math.max((text_width - text_width_pt) / 2, 0)
         elseif field.align == 2 then
@@ -1664,7 +1759,7 @@ function PDF:_build_variable_text_appearance(field)
         end
 
         parts[#parts + 1] = string.format("1 0 0 1 %.2f %.2f Tm", x_pt, y_pt)
-        parts[#parts + 1] = string.format("(%s) Tj", self:_escape_text(line))
+        parts[#parts + 1] = string.format("(%s) Tj", self:_escape_text(encoded_line))
     end
 
     parts[#parts + 1] = "ET"
@@ -2180,7 +2275,11 @@ function PDF:save(filename)
     
     for font_key, font_data in pairs(self.fonts) do
         font_refs[font_key] = obj_num
-        objects[obj_num] = "<</Type /Font /Subtype /Type1 /BaseFont /" .. font_data.base_font .. ">>"
+        local encoding_part = ""
+        if font_data.family == "Helvetica" or font_data.family == "Times" or font_data.family == "Courier" then
+            encoding_part = " /Encoding /WinAnsiEncoding"
+        end
+        objects[obj_num] = "<</Type /Font /Subtype /Type1 /BaseFont /" .. font_data.base_font .. encoding_part .. ">>"
         obj_num = obj_num + 1
     end
 

@@ -85,6 +85,7 @@ doc:text(10, 28, "Red text sample")
 doc:set_color_fill(0.5, 0.5, 0.5)
 assert(doc.current_color_fill[1] == 0.5, "Should accept 0-1 values")
 doc:text(10, 36, "Gray text sample")
+doc:text(10, 44, "Cafe" .. string.char(0xC3, 0xA9) .. " costs 5" .. string.char(0xE2, 0x82, 0xAC))
 print("✓ Color settings work correctly")
 
 -- Test 5: Utils functions
@@ -285,8 +286,9 @@ spec_doc:set_metadata({
 spec_doc:add_page(210, 297)
 spec_doc:set_font("Times", "I", 12)
 spec_doc:text(10, 10, "First line\nSecond line")
+spec_doc:text(10, 26, "Cafe" .. string.char(0xC3, 0xA9) .. " costs 5" .. string.char(0xE2, 0x82, 0xAC))
 spec_doc:form_text(10, 20, 60, 10, "spec_field", {
-    value = "Value",
+    value = "R" .. string.char(0xC3, 0xA9) .. "sum" .. string.char(0xC3, 0xA9),
 })
 spec_doc:save("spec_output.pdf")
 
@@ -299,10 +301,14 @@ local b1, b2, b3, b4 = string.byte(spec_contents, 11, 14)
 assert(b1 and b1 >= 128 and b2 and b2 >= 128 and b3 and b3 >= 128 and b4 and b4 >= 128,
     "Binary PDF header marker should include at least four bytes above 127")
 assert(spec_contents:find("/BaseFont /Times-Italic", 1, true), "Times italic should use the standard base-14 font name")
+assert(spec_contents:find("/Encoding /WinAnsiEncoding", 1, true), "Base-14 text fonts should declare WinAnsiEncoding for rendered text")
 assert(spec_contents:find("/NeedAppearances false", 1, true), "Widgets with explicit appearances should not require viewer-generated appearances")
 assert(spec_contents:find("/FT /Tx", 1, true) and spec_contents:find("/AP <</N ", 1, true), "Variable text widgets should include explicit appearance streams")
 assert(spec_contents:find("<FEFF", 1, true), "Non-ASCII text strings should be serialized as UTF-16BE hex strings")
 assert(spec_contents:find(" Tm\n%(First line%) Tj\n1 0 0 1 ", 1), "Text positioning should use absolute text matrices per line")
+assert(not spec_contents:find("Cafe" .. string.char(0xC3, 0xA9), 1, true), "Rendered page text should not be written as raw UTF-8 bytes")
+assert(spec_contents:find("Cafe" .. string.char(0xE9), 1, true), "Rendered page text should be transcoded to WinAnsi bytes")
+assert(spec_contents:find("5" .. string.char(0x80), 1, true), "Euro sign should be transcoded to WinAnsi")
 os.remove("spec_output.pdf")
 print("✓ Spec-oriented serialization checks passed")
 
