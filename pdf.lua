@@ -14,6 +14,13 @@ local function mm_to_pt(mm)
     return mm * 2.83464567  -- 1 mm = 2.83464567 points
 end
 
+local function normalize_rgb(r, g, b)
+    if r > 1 or g > 1 or b > 1 then
+        return r / 255, g / 255, b / 255
+    end
+    return r, g, b
+end
+
 local function read_u32_be(data, pos)
     local a, b, c, d = string.byte(data, pos, pos + 3)
     return ((a * 256 + b) * 256 + c) * 256 + d
@@ -595,6 +602,7 @@ function Page.new(width, height)
         width = width,
         height = height,
         contents = {},
+        annotations = {},
         resources = {
             Font = {},
             XObject = {},
@@ -626,6 +634,7 @@ function PDF.new()
         current_color_stroke = {0, 0, 0},
         current_line_width = 0.5,
         compression = true,
+        forms = {},
         title = "Untitled",
         author = "Lua PDF Library",
         subject = "",
@@ -642,6 +651,7 @@ function PDF:add_page(width, height, orientation)
     
     local page = Page.new(width, height)
     table.insert(self.pages, page)
+    page.index = #self.pages
     self.current_page = page
     
     return page
@@ -800,6 +810,395 @@ function PDF:_escape_text(text)
     text = text:gsub("%(", "\\(")
     text = text:gsub("%)", "\\)")
     return text
+end
+
+function PDF:_ensure_form_font()
+    local font_key = "Helvetica-"
+    if not self.fonts[font_key] then
+        self.fonts[font_key] = {
+            family = "Helvetica",
+            style = "",
+            base_font = self:_get_base_font_name("Helvetica", "")
+        }
+    end
+    return font_key
+end
+
+function PDF:_register_form_field(field)
+    if not self.current_page then
+        error("No page added. Call add_page first.")
+    end
+
+    field.page_index = self.current_page.index
+    table.insert(self.forms, field)
+    table.insert(self.current_page.annotations, #self.forms)
+    return field
+end
+
+function PDF:_field_rect(x, y, width, height)
+    local x1 = mm_to_pt(x)
+    local y1 = self.current_page.height * 2.83464567 - mm_to_pt(y + height)
+    local x2 = x1 + mm_to_pt(width)
+    local y2 = y1 + mm_to_pt(height)
+    return x1, y1, x2, y2
+end
+
+function PDF:_build_text_field_flags(options)
+    local flags = 0
+    if options.read_only then
+        flags = flags + 1
+    end
+    if options.required then
+        flags = flags + 2
+    end
+    if options.multiline then
+        flags = flags + 4096
+    end
+    if options.password then
+        flags = flags + 8192
+    end
+    if options.do_not_spell_check then
+        flags = flags + 4194304
+    end
+    if options.do_not_scroll then
+        flags = flags + 8388608
+    end
+    return flags
+end
+
+function PDF:_build_common_field_flags(options)
+    local flags = 0
+    if options.read_only then
+        flags = flags + 1
+    end
+    if options.required then
+        flags = flags + 2
+    end
+    return flags
+end
+
+function PDF:_build_choice_field_flags(options)
+    local flags = self:_build_common_field_flags(options)
+    if options.combo then
+        flags = flags + 131072
+    end
+    if options.editable then
+        flags = flags + 262144
+    end
+    if options.sort then
+        flags = flags + 524288
+    end
+    if options.multi_select then
+        flags = flags + 2097152
+    end
+    if options.do_not_spell_check then
+        flags = flags + 4194304
+    end
+    if options.commit_on_change then
+        flags = flags + 67108864
+    end
+    return flags
+end
+
+function PDF:_pdf_literal(value)
+    return "(" .. self:_escape_text(tostring(value or "")) .. ")"
+end
+
+function PDF:_pdf_string_array(values)
+    local parts = {}
+    for i = 1, #values do
+        parts[i] = self:_pdf_literal(values[i])
+    end
+    return "[" .. table.concat(parts, " ") .. "]"
+end
+
+function PDF:_build_checkbox_appearance(width_pt, height_pt, checked)
+    local inset = math.max(math.min(width_pt, height_pt) * 0.18, 2)
+    local stroke = math.max(math.min(width_pt, height_pt) * 0.08, 1)
+    local parts = {
+        "1 1 1 rg",
+        "0 0 0 RG",
+        "1 w",
+        string.format("0 0 %.2f %.2f re", width_pt, height_pt),
+        "B",
+    }
+
+    if checked then
+        parts[#parts + 1] = "0 0 0 RG"
+        parts[#parts + 1] = string.format("%.2f w", stroke)
+        parts[#parts + 1] = string.format("%.2f %.2f m", inset, height_pt * 0.45)
+        parts[#parts + 1] = string.format("%.2f %.2f l", width_pt * 0.42, inset)
+        parts[#parts + 1] = string.format("%.2f %.2f l", width_pt - inset, height_pt - inset)
+        parts[#parts + 1] = "S"
+    end
+
+    return table.concat(parts, "\n")
+end
+
+function PDF:_build_radio_appearance(width_pt, height_pt, checked)
+    local radius = math.min(width_pt, height_pt) * 0.5
+    local cx = width_pt * 0.5
+    local cy = height_pt * 0.5
+    local outer = radius - 1
+    local inner = math.max(radius * 0.42, 1.5)
+    local k_outer = outer * 0.5522847498
+    local k_inner = inner * 0.5522847498
+
+    local parts = {
+        "1 1 1 rg",
+        "0 0 0 RG",
+        "1 w",
+        string.format("%.2f %.2f m", cx + outer, cy),
+        string.format("%.2f %.2f %.2f %.2f %.2f %.2f c", cx + outer, cy + k_outer, cx + k_outer, cy + outer, cx, cy + outer),
+        string.format("%.2f %.2f %.2f %.2f %.2f %.2f c", cx - k_outer, cy + outer, cx - outer, cy + k_outer, cx - outer, cy),
+        string.format("%.2f %.2f %.2f %.2f %.2f %.2f c", cx - outer, cy - k_outer, cx - k_outer, cy - outer, cx, cy - outer),
+        string.format("%.2f %.2f %.2f %.2f %.2f %.2f c", cx + k_outer, cy - outer, cx + outer, cy - k_outer, cx + outer, cy),
+        "B",
+    }
+
+    if checked then
+        parts[#parts + 1] = "0 0 0 rg"
+        parts[#parts + 1] = string.format("%.2f %.2f m", cx + inner, cy)
+        parts[#parts + 1] = string.format("%.2f %.2f %.2f %.2f %.2f %.2f c", cx + inner, cy + k_inner, cx + k_inner, cy + inner, cx, cy + inner)
+        parts[#parts + 1] = string.format("%.2f %.2f %.2f %.2f %.2f %.2f c", cx - k_inner, cy + inner, cx - inner, cy + k_inner, cx - inner, cy)
+        parts[#parts + 1] = string.format("%.2f %.2f %.2f %.2f %.2f %.2f c", cx - inner, cy - k_inner, cx - k_inner, cy - inner, cx, cy - inner)
+        parts[#parts + 1] = string.format("%.2f %.2f %.2f %.2f %.2f %.2f c", cx + k_inner, cy - inner, cx + inner, cy - k_inner, cx + inner, cy)
+        parts[#parts + 1] = "f"
+    end
+
+    return table.concat(parts, "\n")
+end
+
+function PDF:form_text(x, y, width, height, name, options)
+    if not self.current_page then
+        error("No page added. Call add_page first.")
+    end
+    if not name or name == "" then
+        error("form_text requires a field name.")
+    end
+
+    options = options or {}
+    self:_ensure_form_font()
+
+    local x1, y1, x2, y2 = self:_field_rect(x, y, width, height)
+    local font_size = options.font_size or self.current_font_size or 12
+    local value = tostring(options.value or "")
+    local border_width = options.border_width or 1
+    local align = ({L = 0, C = 1, R = 2})[options.align or "L"] or 0
+    local border = options.border_color or {0, 0, 0}
+    local background = options.background_color or {1, 1, 1}
+    local text_color = options.text_color or self.current_color_fill or {0, 0, 0}
+
+    local br, bg, bb = normalize_rgb(border[1] or 0, border[2] or 0, border[3] or 0)
+    local r, g, b = normalize_rgb(background[1] or 1, background[2] or 1, background[3] or 1)
+    local tr, tg, tb = normalize_rgb(text_color[1] or 0, text_color[2] or 0, text_color[3] or 0)
+
+    return self:_register_form_field({
+        field_type = "text",
+        name = tostring(name),
+        value = value,
+        default_value = tostring(options.default_value or value),
+        rect = {x1, y1, x2, y2},
+        width_pt = x2 - x1,
+        height_pt = y2 - y1,
+        font_size = font_size,
+        align = align,
+        flags = self:_build_text_field_flags(options),
+        border_width = border_width,
+        border_color = {br, bg, bb},
+        background_color = {r, g, b},
+        text_color = {tr, tg, tb},
+    })
+end
+
+function PDF:form_checkbox(x, y, size, name, checked, options)
+    if not self.current_page then
+        error("No page added. Call add_page first.")
+    end
+    if not name or name == "" then
+        error("form_checkbox requires a field name.")
+    end
+
+    options = options or {}
+    local x1, y1, x2, y2 = self:_field_rect(x, y, size, size)
+
+    return self:_register_form_field({
+        field_type = "checkbox",
+        name = tostring(name),
+        checked = checked and true or false,
+        rect = {x1, y1, x2, y2},
+        width_pt = x2 - x1,
+        height_pt = y2 - y1,
+        read_only = options.read_only and true or false,
+        required = options.required and true or false,
+    })
+end
+
+function PDF:form_combo(x, y, width, height, name, choices, options)
+    if not self.current_page then
+        error("No page added. Call add_page first.")
+    end
+    if not name or name == "" then
+        error("form_combo requires a field name.")
+    end
+    if type(choices) ~= "table" or #choices == 0 then
+        error("form_combo requires a non-empty choices array.")
+    end
+
+    options = options or {}
+    self:_ensure_form_font()
+
+    local x1, y1, x2, y2 = self:_field_rect(x, y, width, height)
+    local font_size = options.font_size or self.current_font_size or 12
+    local border_width = options.border_width or 1
+    local align = ({L = 0, C = 1, R = 2})[options.align or "L"] or 0
+    local value = options.value or choices[1]
+    local border = options.border_color or {0, 0, 0}
+    local background = options.background_color or {1, 1, 1}
+    local text_color = options.text_color or self.current_color_fill or {0, 0, 0}
+
+    local br, bg, bb = normalize_rgb(border[1] or 0, border[2] or 0, border[3] or 0)
+    local r, g, b = normalize_rgb(background[1] or 1, background[2] or 1, background[3] or 1)
+    local tr, tg, tb = normalize_rgb(text_color[1] or 0, text_color[2] or 0, text_color[3] or 0)
+
+    return self:_register_form_field({
+        field_type = "choice",
+        name = tostring(name),
+        choices = choices,
+        value = tostring(value),
+        default_value = tostring(options.default_value or value),
+        rect = {x1, y1, x2, y2},
+        font_size = font_size,
+        align = align,
+        flags = self:_build_choice_field_flags({
+            read_only = options.read_only,
+            required = options.required,
+            combo = true,
+            editable = options.editable,
+            sort = options.sort,
+            do_not_spell_check = options.do_not_spell_check,
+            commit_on_change = options.commit_on_change,
+        }),
+        border_width = border_width,
+        border_color = {br, bg, bb},
+        background_color = {r, g, b},
+        text_color = {tr, tg, tb},
+    })
+end
+
+function PDF:form_list(x, y, width, height, name, choices, options)
+    if not self.current_page then
+        error("No page added. Call add_page first.")
+    end
+    if not name or name == "" then
+        error("form_list requires a field name.")
+    end
+    if type(choices) ~= "table" or #choices == 0 then
+        error("form_list requires a non-empty choices array.")
+    end
+
+    options = options or {}
+    self:_ensure_form_font()
+
+    local x1, y1, x2, y2 = self:_field_rect(x, y, width, height)
+    local font_size = options.font_size or self.current_font_size or 12
+    local border_width = options.border_width or 1
+    local align = ({L = 0, C = 1, R = 2})[options.align or "L"] or 0
+    local value = options.value
+    if value == nil then
+        if options.multi_select then
+            value = {choices[1]}
+        else
+            value = choices[1]
+        end
+    end
+    local border = options.border_color or {0, 0, 0}
+    local background = options.background_color or {1, 1, 1}
+    local text_color = options.text_color or self.current_color_fill or {0, 0, 0}
+
+    local br, bg, bb = normalize_rgb(border[1] or 0, border[2] or 0, border[3] or 0)
+    local r, g, b = normalize_rgb(background[1] or 1, background[2] or 1, background[3] or 1)
+    local tr, tg, tb = normalize_rgb(text_color[1] or 0, text_color[2] or 0, text_color[3] or 0)
+
+    return self:_register_form_field({
+        field_type = "choice",
+        name = tostring(name),
+        choices = choices,
+        value = value,
+        default_value = options.default_value or value,
+        rect = {x1, y1, x2, y2},
+        font_size = font_size,
+        align = align,
+        flags = self:_build_choice_field_flags({
+            read_only = options.read_only,
+            required = options.required,
+            sort = options.sort,
+            multi_select = options.multi_select,
+            do_not_spell_check = options.do_not_spell_check,
+            commit_on_change = options.commit_on_change,
+        }),
+        border_width = border_width,
+        border_color = {br, bg, bb},
+        background_color = {r, g, b},
+        text_color = {tr, tg, tb},
+        top_index = options.top_index or 0,
+    })
+end
+
+function PDF:form_signature(x, y, width, height, name, options)
+    if not self.current_page then
+        error("No page added. Call add_page first.")
+    end
+    if not name or name == "" then
+        error("form_signature requires a field name.")
+    end
+
+    options = options or {}
+    local x1, y1, x2, y2 = self:_field_rect(x, y, width, height)
+    local border_width = options.border_width or 1
+    local border = options.border_color or {0, 0, 0}
+    local background = options.background_color or {1, 1, 1}
+
+    local br, bg, bb = normalize_rgb(border[1] or 0, border[2] or 0, border[3] or 0)
+    local r, g, b = normalize_rgb(background[1] or 1, background[2] or 1, background[3] or 1)
+
+    return self:_register_form_field({
+        field_type = "signature",
+        name = tostring(name),
+        rect = {x1, y1, x2, y2},
+        flags = self:_build_common_field_flags(options),
+        border_width = border_width,
+        border_color = {br, bg, bb},
+        background_color = {r, g, b},
+    })
+end
+
+function PDF:form_radio(x, y, size, group_name, option_name, checked, options)
+    if not self.current_page then
+        error("No page added. Call add_page first.")
+    end
+    if not group_name or group_name == "" then
+        error("form_radio requires a group name.")
+    end
+    if not option_name or option_name == "" then
+        error("form_radio requires an option name.")
+    end
+
+    options = options or {}
+    local x1, y1, x2, y2 = self:_field_rect(x, y, size, size)
+
+    return self:_register_form_field({
+        field_type = "radio",
+        name = tostring(group_name),
+        option_name = tostring(option_name),
+        checked = checked and true or false,
+        rect = {x1, y1, x2, y2},
+        width_pt = x2 - x1,
+        height_pt = y2 - y1,
+        read_only = options.read_only and true or false,
+        required = options.required and true or false,
+        no_toggle_to_off = options.no_toggle_to_off and true or false,
+    })
 end
 
 function PDF:rect(x, y, width, height, style)
@@ -967,11 +1366,7 @@ function PDF:set_color_fill(r, g, b, a)
     a = a or 1
     
     -- Normalize if values are 0-255
-    if r > 1 or g > 1 or b > 1 then
-        r = r / 255
-        g = g / 255
-        b = b / 255
-    end
+    r, g, b = normalize_rgb(r, g, b)
     
     self.current_color_fill = {r, g, b, a}
     
@@ -985,11 +1380,7 @@ function PDF:set_color_stroke(r, g, b, a)
     a = a or 1
     
     -- Normalize if values are 0-255
-    if r > 1 or g > 1 or b > 1 then
-        r = r / 255
-        g = g / 255
-        b = b / 255
-    end
+    r, g, b = normalize_rgb(r, g, b)
     
     self.current_color_stroke = {r, g, b, a}
     
@@ -1018,10 +1409,7 @@ function PDF:save(filename)
     local objects = {}
     local object_offsets = {}
     
-    -- Object 1: Catalog
-    objects[1] = "<</Type /Catalog /Pages 2 0 R>>"
-    
-    -- Objects 3+: Font objects, page objects, and content streams
+    -- Objects 3+: Font objects, page objects, form fields, and content streams
     local obj_num = 3
     local font_refs = {}
     local image_refs = {}
@@ -1061,6 +1449,65 @@ function PDF:save(filename)
         page_refs[page_idx] = obj_num
         obj_num = obj_num + 2
     end
+
+    local acroform_ref
+    local field_refs = {}
+    local checkbox_appearance_refs = {}
+    local radio_group_refs = {}
+    local radio_group_order = {}
+    local radio_appearance_refs = {}
+    if #self.forms > 0 then
+        self:_ensure_form_font()
+        acroform_ref = obj_num
+        obj_num = obj_num + 1
+        for field_idx, field in ipairs(self.forms) do
+            if field.field_type == "radio" then
+                local group = radio_group_refs[field.name]
+                if not group then
+                    group = {
+                        parent_ref = obj_num,
+                        widgets = {},
+                        selected = nil,
+                        flags = 32768 + self:_build_common_field_flags(field) + (field.no_toggle_to_off and 16384 or 0),
+                    }
+                    radio_group_refs[field.name] = group
+                    radio_group_order[#radio_group_order + 1] = field.name
+                    obj_num = obj_num + 1
+                elseif field.checked then
+                    group.selected = field.option_name
+                end
+                if field.checked and not group.selected then
+                    group.selected = field.option_name
+                end
+
+                field_refs[field_idx] = obj_num
+                group.widgets[#group.widgets + 1] = field_idx
+                obj_num = obj_num + 1
+                radio_appearance_refs[field_idx] = {
+                    off = obj_num,
+                    yes = obj_num + 1,
+                }
+                obj_num = obj_num + 2
+            else
+                field_refs[field_idx] = obj_num
+                obj_num = obj_num + 1
+            end
+            if field.field_type == "checkbox" then
+                checkbox_appearance_refs[field_idx] = {
+                    off = obj_num,
+                    yes = obj_num + 1,
+                }
+                obj_num = obj_num + 2
+            end
+        end
+    end
+
+    -- Object 1: Catalog
+    local catalog = "<</Type /Catalog /Pages 2 0 R"
+    if acroform_ref then
+        catalog = catalog .. " /AcroForm " .. acroform_ref .. " 0 R"
+    end
+    objects[1] = catalog .. ">>"
     
     -- Object 2: Pages
     local kids = "["
@@ -1094,17 +1541,195 @@ function PDF:save(filename)
             font_dict = font_dict .. ">>"
         end
         font_dict = font_dict .. ">>"
+
+        local annots_part = ""
+        if #page.annotations > 0 then
+            local annot_refs = {}
+            for _, field_idx in ipairs(page.annotations) do
+                annot_refs[#annot_refs + 1] = field_refs[field_idx] .. " 0 R"
+            end
+            annots_part = " /Annots [" .. table.concat(annot_refs, " ") .. "]"
+        end
         
         -- Page object
         local page_obj = "<</Type /Page /Parent 2 0 R /MediaBox [0 0 " .. 
                          page_width .. " " .. page_height .. "] /Resources " .. font_dict ..
-                         " /Contents " .. content_obj_num .. " 0 R>>"
+                         annots_part .. " /Contents " .. content_obj_num .. " 0 R>>"
         objects[page_obj_num] = page_obj
         
         -- Content stream object
         local stream_data = page:get_content_stream()
         local stream_obj = "stream\n" .. stream_data .. "\nendstream"
         objects[content_obj_num] = "<</Length " .. #stream_data .. ">>\n" .. stream_obj
+    end
+
+    if acroform_ref then
+        local field_list = {}
+        for _, group_name in ipairs(radio_group_order) do
+            field_list[#field_list + 1] = radio_group_refs[group_name].parent_ref .. " 0 R"
+        end
+        for field_idx = 1, #self.forms do
+            if self.forms[field_idx].field_type ~= "radio" then
+                field_list[#field_list + 1] = field_refs[field_idx] .. " 0 R"
+            end
+        end
+        local form_font_ref = font_refs[self:_ensure_form_font()]
+        objects[acroform_ref] = "<</Fields [" .. table.concat(field_list, " ") ..
+            "] /NeedAppearances true /DR <</Font <</Helv " .. form_font_ref ..
+            " 0 R>>>> /DA (/Helv 12 Tf 0 g)>>"
+
+        for _, group_name in ipairs(radio_group_order) do
+            local group = radio_group_refs[group_name]
+            local kid_refs = {}
+            for _, field_idx in ipairs(group.widgets) do
+                kid_refs[#kid_refs + 1] = field_refs[field_idx] .. " 0 R"
+            end
+            local value_part = group.selected and (" /V /" .. group.selected) or ""
+            objects[group.parent_ref] = string.format(
+                "<</FT /Btn /T (%s) /Ff %d%s /Kids [%s]>>",
+                self:_escape_text(group_name),
+                group.flags,
+                value_part,
+                table.concat(kid_refs, " ")
+            )
+        end
+
+        for field_idx, field in ipairs(self.forms) do
+            local rect = string.format("[%.2f %.2f %.2f %.2f]",
+                field.rect[1], field.rect[2], field.rect[3], field.rect[4])
+
+            if field.field_type == "text" then
+                local da = string.format("/Helv %d Tf %.3f %.3f %.3f rg",
+                    field.font_size,
+                    field.text_color[1],
+                    field.text_color[2],
+                    field.text_color[3])
+                objects[field_refs[field_idx]] = string.format(
+                    "<</Type /Annot /Subtype /Widget /FT /Tx /T (%s) /Rect %s /P %d 0 R /F 4 /DA (%s) /Q %d /V (%s) /DV (%s) /MK <</BC [%.3f %.3f %.3f] /BG [%.3f %.3f %.3f]>> /BS <</W %.2f /S /S>> /Ff %d>>",
+                    self:_escape_text(field.name),
+                    rect,
+                    page_refs[field.page_index],
+                    da,
+                    field.align,
+                    self:_escape_text(field.value),
+                    self:_escape_text(field.default_value),
+                    field.border_color[1], field.border_color[2], field.border_color[3],
+                    field.background_color[1], field.background_color[2], field.background_color[3],
+                    field.border_width,
+                    field.flags
+                )
+            elseif field.field_type == "checkbox" then
+                local appearance_refs = checkbox_appearance_refs[field_idx]
+                local flags = self:_build_common_field_flags(field)
+                local state_name = field.checked and "/Yes" or "/Off"
+
+                objects[appearance_refs.off] = string.format(
+                    "<</Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>> /Length %d>>\nstream\n%s\nendstream",
+                    field.width_pt,
+                    field.height_pt,
+                    #self:_build_checkbox_appearance(field.width_pt, field.height_pt, false),
+                    self:_build_checkbox_appearance(field.width_pt, field.height_pt, false)
+                )
+                objects[appearance_refs.yes] = string.format(
+                    "<</Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>> /Length %d>>\nstream\n%s\nendstream",
+                    field.width_pt,
+                    field.height_pt,
+                    #self:_build_checkbox_appearance(field.width_pt, field.height_pt, true),
+                    self:_build_checkbox_appearance(field.width_pt, field.height_pt, true)
+                )
+
+                objects[field_refs[field_idx]] = string.format(
+                    "<</Type /Annot /Subtype /Widget /FT /Btn /T (%s) /Rect %s /P %d 0 R /F 4 /V %s /AS %s /AP <</N <</Off %d 0 R /Yes %d 0 R>>>> /MK <</BC [0 0 0] /BG [1 1 1] /CA (4)>> /BS <</W 1 /S /S>> /Ff %d>>",
+                    self:_escape_text(field.name),
+                    rect,
+                    page_refs[field.page_index],
+                    state_name,
+                    state_name,
+                    appearance_refs.off,
+                    appearance_refs.yes,
+                    flags
+                )
+            elseif field.field_type == "choice" then
+                local da = string.format("/Helv %d Tf %.3f %.3f %.3f rg",
+                    field.font_size,
+                    field.text_color[1],
+                    field.text_color[2],
+                    field.text_color[3])
+                local choice_opts = self:_pdf_string_array(field.choices)
+                local value_literal
+                local default_literal
+                if type(field.value) == "table" then
+                    value_literal = self:_pdf_string_array(field.value)
+                else
+                    value_literal = self:_pdf_literal(field.value)
+                end
+                if type(field.default_value) == "table" then
+                    default_literal = self:_pdf_string_array(field.default_value)
+                else
+                    default_literal = self:_pdf_literal(field.default_value)
+                end
+                objects[field_refs[field_idx]] = string.format(
+                    "<</Type /Annot /Subtype /Widget /FT /Ch /T (%s) /Rect %s /P %d 0 R /F 4 /DA (%s) /Q %d /Opt %s /V %s /DV %s /MK <</BC [%.3f %.3f %.3f] /BG [%.3f %.3f %.3f]>> /BS <</W %.2f /S /S>> /TI %d /Ff %d>>",
+                    self:_escape_text(field.name),
+                    rect,
+                    page_refs[field.page_index],
+                    da,
+                    field.align,
+                    choice_opts,
+                    value_literal,
+                    default_literal,
+                    field.border_color[1], field.border_color[2], field.border_color[3],
+                    field.background_color[1], field.background_color[2], field.background_color[3],
+                    field.border_width,
+                    field.top_index or 0,
+                    field.flags
+                )
+            elseif field.field_type == "signature" then
+                objects[field_refs[field_idx]] = string.format(
+                    "<</Type /Annot /Subtype /Widget /FT /Sig /T (%s) /Rect %s /P %d 0 R /F 4 /MK <</BC [%.3f %.3f %.3f] /BG [%.3f %.3f %.3f]>> /BS <</W %.2f /S /S>> /Ff %d>>",
+                    self:_escape_text(field.name),
+                    rect,
+                    page_refs[field.page_index],
+                    field.border_color[1], field.border_color[2], field.border_color[3],
+                    field.background_color[1], field.background_color[2], field.background_color[3],
+                    field.border_width,
+                    field.flags
+                )
+            elseif field.field_type == "radio" then
+                local appearance_refs = radio_appearance_refs[field_idx]
+                local group = radio_group_refs[field.name]
+                local on_state = "/" .. field.option_name
+                local state_name = field.checked and on_state or "/Off"
+                local off_stream = self:_build_radio_appearance(field.width_pt, field.height_pt, false)
+                local on_stream = self:_build_radio_appearance(field.width_pt, field.height_pt, true)
+
+                objects[appearance_refs.off] = string.format(
+                    "<</Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>> /Length %d>>\nstream\n%s\nendstream",
+                    field.width_pt,
+                    field.height_pt,
+                    #off_stream,
+                    off_stream
+                )
+                objects[appearance_refs.yes] = string.format(
+                    "<</Type /XObject /Subtype /Form /BBox [0 0 %.2f %.2f] /Resources <<>> /Length %d>>\nstream\n%s\nendstream",
+                    field.width_pt,
+                    field.height_pt,
+                    #on_stream,
+                    on_stream
+                )
+
+                objects[field_refs[field_idx]] = string.format(
+                    "<</Type /Annot /Subtype /Widget /Parent %d 0 R /Rect %s /P %d 0 R /F 4 /AS %s /AP <</N <</Off %d 0 R %s %d 0 R>>>> /MK <</BC [0 0 0] /BG [1 1 1]>> /BS <</W 1 /S /S>>>>",
+                    group.parent_ref,
+                    rect,
+                    page_refs[field.page_index],
+                    state_name,
+                    appearance_refs.off,
+                    on_state,
+                    appearance_refs.yes
+                )
+            end
+        end
     end
     
     -- Info object

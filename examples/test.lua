@@ -159,8 +159,54 @@ doc:text(40, 48, "RGBA PNG")
 doc:text(75, 80, "Cat PNG")
 print("✓ PNG embedding works")
 
--- Test 11: PDF generation
-print("\nTest 11: Generating PDF file...")
+-- Test 11: AcroForm fields
+print("\nTest 11: Testing form fields...")
+doc:add_page(210, 297)
+doc:set_font("Helvetica", "", 10)
+doc:set_color_fill(0, 0, 0)
+doc:text(10, 10, "Page 6: AcroForm widgets")
+doc:text(10, 22, "Name")
+doc:form_text(10, 26, 80, 10, "test_name", {
+    value = "Test User",
+})
+doc:text(10, 44, "Notes")
+doc:form_text(10, 48, 120, 18, "test_notes", {
+    value = "Multiline field",
+    multiline = true,
+})
+doc:text(10, 76, "Receive updates")
+doc:form_checkbox(10, 80, 6, "test_opt_in", true)
+doc:text(10, 94, "Role")
+doc:form_combo(10, 98, 70, 10, "test_role", {
+    "Admin",
+    "Editor",
+    "Viewer",
+}, {
+    value = "Editor",
+})
+doc:text(10, 116, "Tags")
+doc:form_list(10, 120, 90, 22, "test_tags", {
+    "Alpha",
+    "Beta",
+    "Gamma",
+}, {
+    value = {"Alpha", "Gamma"},
+    multi_select = true,
+})
+doc:text(10, 152, "Signature")
+doc:form_signature(10, 156, 70, 16, "test_signature")
+doc:text(110, 22, "Priority")
+doc:form_radio(110, 26, 6, "test_priority", "Low", false)
+doc:text(118, 26, "Low")
+doc:form_radio(110, 36, 6, "test_priority", "Medium", true)
+doc:text(118, 36, "Medium")
+doc:form_radio(110, 46, 6, "test_priority", "High", false)
+doc:text(118, 46, "High")
+assert(#doc.forms == 9, "Should have 9 form fields")
+print("✓ Form field definitions recorded")
+
+-- Test 12: PDF generation
+print("\nTest 12: Generating PDF file...")
 doc.title = "Test Document"
 doc.author = "Lua PDF Test Suite"
 doc.subject = "Testing the PDF library"
